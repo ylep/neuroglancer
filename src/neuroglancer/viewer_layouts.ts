@@ -63,10 +63,10 @@ export function makeOrthogonalSliceViews(viewerState: SliceViewViewerState) {
   let addSliceView = (q?: quat) => {
     sliceViews.push(makeSliceView(viewerState, q));
   };
-  addSliceView(quat.rotateZ(
-      quat.create(), quat.rotateY(quat.create(), quat.create(), Math.PI / 2), Math.PI / 2));
-  addSliceView(quat.rotateX(quat.create(), quat.create(), Math.PI / 2));
-  addSliceView();
+  addSliceView(quat.rotateY(
+      quat.create(), quat.rotateX(quat.create(), quat.create(), -Math.PI / 2), -Math.PI / 2));
+  addSliceView(quat.rotateX(quat.create(), quat.create(), -Math.PI / 2));
+  addSliceView(quat.rotateX(quat.create(), quat.create(), Math.PI));
   return sliceViews;
 }
 
