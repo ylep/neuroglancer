@@ -18,9 +18,9 @@ import {ChunkManager, registerChunkSource} from 'neuroglancer/chunk_manager/back
 import {ChunkPriorityTier} from 'neuroglancer/chunk_manager/base';
 import {GenericFileSource, PriorityGetter} from 'neuroglancer/chunk_manager/generic_file_source';
 import {GET_NIFTI_VOLUME_INFO_RPC_ID, NiftiDataType, NiftiVolumeInfo, VolumeSourceParameters} from 'neuroglancer/datasource/nifti/base';
-import {ParameterizedVolumeChunkSource, VolumeChunk} from 'neuroglancer/sliceview/backend';
 import {decodeRawChunk} from 'neuroglancer/sliceview/backend_chunk_decoders/raw';
-import {DataType, VolumeType} from 'neuroglancer/sliceview/base';
+import {ParameterizedVolumeChunkSource, VolumeChunk} from 'neuroglancer/sliceview/volume/backend';
+import {DataType, VolumeType} from 'neuroglancer/sliceview/volume/base';
 import {CancellationToken} from 'neuroglancer/util/cancellation';
 import {Endianness} from 'neuroglancer/util/endian';
 import {mat4, quat, vec3} from 'neuroglancer/util/geom';
@@ -95,8 +95,8 @@ registerPromiseRPC(
             let dataTypeInfo = DATA_TYPE_CONVERSIONS.get(header.datatypeCode);
             if (dataTypeInfo === undefined) {
               throw new Error(
-                  `Unsupported data type: ${NiftiDataType[header.datatypeCode] ||
-                  header.datatypeCode}.`);
+                  `Unsupported data type: ` +
+                  `${NiftiDataType[header.datatypeCode] || header.datatypeCode}.`);
             }
             if (header.dims[4] !== 1) {
               throw new Error(`Time series data not supported.`);
@@ -141,7 +141,7 @@ registerPromiseRPC(
     });
 
 @registerChunkSource(VolumeSourceParameters)
-class VolumeChunkSource extends ParameterizedVolumeChunkSource<VolumeSourceParameters> {
+export class VolumeChunkSource extends ParameterizedVolumeChunkSource<VolumeSourceParameters> {
   download(chunk: VolumeChunk, cancellationToken: CancellationToken) {
     chunk.chunkDataSize = this.spec.chunkDataSize;
     return getNiftiFileData(

@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-import {simpleStringHash} from 'neuroglancer/util/hash';
 import {CancellationToken, uncancelableToken} from 'neuroglancer/util/cancellation';
+import {simpleStringHash} from 'neuroglancer/util/hash';
 
 export type RequestModifier = (request: XMLHttpRequest) => void;
 
@@ -47,7 +47,7 @@ export class HttpError extends Error {
     return new HttpError(
         (<any>xhr)[METHOD_SYMBOL], (<any>xhr)[URL_SYMBOL], xhr.status, xhr.statusText);
   }
-};
+}
 
 export function openHttpRequest(url: string, method = 'GET') {
   let xhr = new XMLHttpRequest();
@@ -76,14 +76,20 @@ export function openShardedHttpRequest(baseUrls: string|string[], path: string, 
 }
 
 export function sendHttpRequest(
-  xhr: XMLHttpRequest, responseType: 'arraybuffer', token?: CancellationToken): Promise<ArrayBuffer>;
-export function sendHttpRequest(xhr: XMLHttpRequest, responseType: 'json', token?: CancellationToken): Promise<any>;
-export function sendHttpRequest(xhr: XMLHttpRequest, responseType: string, token?: CancellationToken): any;
-
-export function sendHttpRequest(xhr: XMLHttpRequest, responseType: string, token: CancellationToken = uncancelableToken) {
+    xhr: XMLHttpRequest, responseType: 'arraybuffer',
+    token?: CancellationToken): Promise<ArrayBuffer>;
+export function sendHttpRequest(
+    xhr: XMLHttpRequest, responseType: 'json', token?: CancellationToken): Promise<any>;
+export function sendHttpRequest(
+    xhr: XMLHttpRequest, responseType: XMLHttpRequestResponseType, token?: CancellationToken): any;
+export function sendHttpRequest(
+    xhr: XMLHttpRequest, responseType: XMLHttpRequestResponseType,
+    token: CancellationToken = uncancelableToken) {
   xhr.responseType = responseType;
   return new Promise((resolve, reject) => {
-    const abort = () => { xhr.abort(); };
+    const abort = () => {
+      xhr.abort();
+    };
     token.add(abort);
     xhr.onloadend = function(this: XMLHttpRequest) {
       let status = this.status;
@@ -95,6 +101,39 @@ export function sendHttpRequest(xhr: XMLHttpRequest, responseType: string, token
       }
     };
     xhr.send();
+  });
+}
+
+export function sendHttpJsonPostRequest(
+    xhr: XMLHttpRequest, payload: any, responseType: 'arraybuffer',
+    token?: CancellationToken): Promise<ArrayBuffer>;
+export function sendHttpJsonPostRequest(
+    xhr: XMLHttpRequest, payload: any, responseType: 'json',
+    token?: CancellationToken): Promise<any>;
+export function sendHttpJsonPostRequest(
+    xhr: XMLHttpRequest, payload: any, responseType: XMLHttpRequestResponseType,
+    token?: CancellationToken): any;
+
+export function sendHttpJsonPostRequest(
+    xhr: XMLHttpRequest, payload: any, responseType: XMLHttpRequestResponseType,
+    token: CancellationToken = uncancelableToken) {
+  xhr.responseType = responseType;
+  xhr.setRequestHeader('Content-Type', `application/json`);
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      xhr.abort();
+    };
+    token.add(abort);
+    xhr.onloadend = function(this: XMLHttpRequest) {
+      let status = this.status;
+      token.remove(abort);
+      if (status >= 200 && status < 300) {
+        resolve(this.response);
+      } else {
+        reject(HttpError.fromXhr(xhr));
+      }
+    };
+    xhr.send(JSON.stringify(payload));
   });
 }
 

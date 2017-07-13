@@ -15,6 +15,7 @@
  */
 
 import {AvailableCapacity, CHUNK_MANAGER_RPC_ID, CHUNK_QUEUE_MANAGER_RPC_ID, ChunkPriorityTier, ChunkSourceParametersConstructor, ChunkState} from 'neuroglancer/chunk_manager/base';
+import {CancellationToken, CancellationTokenSource} from 'neuroglancer/util/cancellation';
 import {Disposable} from 'neuroglancer/util/disposable';
 import {LinkedListOperations} from 'neuroglancer/util/linked_list';
 import LinkedList0 from 'neuroglancer/util/linked_list.0';
@@ -23,7 +24,6 @@ import {StringMemoize} from 'neuroglancer/util/memoize';
 import {ComparisonFunction, PairingHeapOperations} from 'neuroglancer/util/pairing_heap';
 import PairingHeap0 from 'neuroglancer/util/pairing_heap.0';
 import PairingHeap1 from 'neuroglancer/util/pairing_heap.1';
-import {CancellationTokenSource, CancellationToken} from 'neuroglancer/util/cancellation';
 import {NullarySignal} from 'neuroglancer/util/signal';
 import {initializeSharedObjectCounterpart, registerSharedObject, RPC, SharedObject, SharedObjectCounterpart} from 'neuroglancer/worker_rpc';
 
@@ -102,16 +102,22 @@ export class Chunk implements Disposable {
     this.error = null;
   }
 
-  get chunkManager() { return (<ChunkSource>this.source).chunkManager; }
+  get chunkManager() {
+    return (<ChunkSource>this.source).chunkManager;
+  }
 
-  get queueManager() { return (<ChunkSource>this.source).chunkManager.queueManager; }
+  get queueManager() {
+    return (<ChunkSource>this.source).chunkManager.queueManager;
+  }
 
   downloadFailed(error: any) {
     this.error = error;
     this.queueManager.updateChunkState(this, ChunkState.FAILED);
   }
 
-  downloadSucceeded() { this.queueManager.updateChunkState(this, ChunkState.SYSTEM_MEMORY_WORKER); }
+  downloadSucceeded() {
+    this.queueManager.updateChunkState(this, ChunkState.SYSTEM_MEMORY_WORKER);
+  }
 
   freeSystemMemory() {}
 
@@ -121,15 +127,21 @@ export class Chunk implements Disposable {
     msg['new'] = true;
   }
 
-  toString() { return this.key; }
+  toString() {
+    return this.key;
+  }
 
-  static priorityLess(a: Chunk, b: Chunk) { return a.priority < b.priority; };
+  static priorityLess(a: Chunk, b: Chunk) {
+    return a.priority < b.priority;
+  }
 
-  static priorityGreater(a: Chunk, b: Chunk) { return a.priority > b.priority; }
-};
+  static priorityGreater(a: Chunk, b: Chunk) {
+    return a.priority > b.priority;
+  }
+}
 
 interface ChunkConstructor<T extends Chunk> {
-  new (): T;
+  new(): T;
 }
 
 /**
@@ -141,7 +153,9 @@ export abstract class ChunkSourceBase extends SharedObject {
   chunks: Map<string, Chunk> = new Map<string, Chunk>();
   freeChunks: Chunk[] = new Array<Chunk>();
 
-  constructor(public chunkManager: ChunkManager) { super(); }
+  constructor(public chunkManager: ChunkManager) {
+    super();
+  }
 
   getNewChunk_<T extends Chunk>(chunkType: ChunkConstructor<T>): T {
     let freeChunks = this.freeChunks;
@@ -312,7 +326,7 @@ class ChunkPriorityQueue {
    * Deletes a chunk from this priority queue.
    * @param chunk The chunk to delete from the priority queue.
    */
-  delete (chunk: Chunk) {
+  delete(chunk: Chunk) {
     let priorityTier = chunk.priorityTier;
     if (priorityTier === ChunkPriorityTier.RECENT) {
       this.linkedListOperations.pop(chunk);
@@ -321,7 +335,7 @@ class ChunkPriorityQueue {
       heapRoots[priorityTier] = this.heapOperations.remove(<Chunk>heapRoots[priorityTier], chunk);
     }
   }
-};
+}
 
 function makeChunkPriorityQueue0(compare: ComparisonFunction<Chunk>) {
   return new ChunkPriorityQueue(new PairingHeap0(compare), LinkedList0);
@@ -488,7 +502,8 @@ export class ChunkQueueManager extends SharedObjectCounterpart {
     }
     if (DEBUG_CHUNK_UPDATES) {
       console.log(
-          `${chunk}: changed priority ${chunk.priorityTier}:${chunk.priority} -> ${chunk.newPriorityTier}:${chunk.newPriority}`);
+          `${chunk}: changed priority ${chunk.priorityTier}:` +
+          `${chunk.priority} -> ${chunk.newPriorityTier}:${chunk.newPriority}`);
     }
     this.removeChunkFromQueues_(chunk);
     chunk.updatePriorityProperties();
@@ -553,11 +568,11 @@ export class ChunkQueueManager extends SharedObjectCounterpart {
 
   freeChunkSystemMemory(chunk: Chunk) {
     if (chunk.state === ChunkState.SYSTEM_MEMORY_WORKER) {
+      chunk.freeSystemMemory();
+    } else {
       this.rpc!.invoke(
           'Chunk.update',
           {'id': chunk.key, 'state': ChunkState.EXPIRED, 'source': chunk.source!.rpcId});
-    } else {
-      chunk.freeSystemMemory();
     }
   }
 
@@ -635,16 +650,12 @@ export class ChunkQueueManager extends SharedObjectCounterpart {
   logStatistics() {
     if (DEBUG_CHUNK_UPDATES) {
       console.log(
-          `[Chunk status] QUEUED: ${this.numQueued}, FAILED: ${this.numFailed}, DOWNLOAD: ${this.downloadCapacity}, MEM: ${this.systemMemoryCapacity}, GPU: ${this.gpuMemoryCapacity}`);
+          `[Chunk status] QUEUED: ${this.numQueued}, FAILED: ` +
+          `${this.numFailed}, DOWNLOAD: ${this.downloadCapacity}, ` +
+          `MEM: ${this.systemMemoryCapacity}, GPU: ${this.gpuMemoryCapacity}`);
     }
   }
-};
-
-/*
- * Priority to use for handlers add to recomputeChunkPriorities that should execute last, because
- * they depend on the result of another handler.
- */
-export const RECOMPUTE_CHUNK_PRIORITIES_LAST = -1000;
+}
 
 @registerSharedObject(CHUNK_MANAGER_RPC_ID)
 export class ChunkManager extends SharedObjectCounterpart {
@@ -696,7 +707,7 @@ export class ChunkManager extends SharedObjectCounterpart {
     this.recomputeChunkPriorities.dispatch();
     this.recomputeChunkPrioritiesLate.dispatch();
     this.updateQueueState([ChunkPriorityTier.VISIBLE]);
-  };
+  }
 
   /**
    * @param chunk
@@ -740,7 +751,7 @@ export class ChunkManager extends SharedObjectCounterpart {
     newTierChunks.length = 0;
     this.queueManager.scheduleUpdate();
   }
-};
+}
 
 /**
  * Decorates final subclasses of ChunkSource.
@@ -757,5 +768,29 @@ export function registerChunkSource<Parameters>(
     target.prototype.toString = function(this: {parameters: Parameters}) {
       return parametersConstructor.stringify(this.parameters);
     };
+  };
+}
+
+/**
+ * Interface that represents shared objects that request chunks from a ChunkManager.
+ */
+export interface ChunkRequester extends SharedObject { chunkManager: ChunkManager; }
+
+/**
+ * Mixin that adds a chunkManager property initialized from the RPC-supplied options.
+ *
+ * The resultant class implements `ChunkRequester`.
+ */
+export function withChunkManager<T extends{new (...args: any[]): SharedObject}>(Base: T) {
+  return class extends Base implements ChunkRequester {
+    chunkManager: ChunkManager;
+    constructor(...args: any[]) {
+      super(...args);
+      const rpc: RPC = args[0];
+      const options = args[1];
+      // We don't increment the reference count, because our owner owns a reference to the
+      // ChunkManager.
+      this.chunkManager = this.registerDisposer(<ChunkManager>rpc.get(options['chunkManager']));
+    }
   };
 }

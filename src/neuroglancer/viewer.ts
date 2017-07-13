@@ -31,11 +31,13 @@ import {TrackableBoolean} from 'neuroglancer/trackable_boolean';
 import {TrackableValue} from 'neuroglancer/trackable_value';
 import {RefCounted} from 'neuroglancer/util/disposable';
 import {vec3} from 'neuroglancer/util/geom';
-import {GlobalKeyboardShortcutHandler, KeySequenceMap} from 'neuroglancer/util/keyboard_shortcut_handler';
+import {globalKeyboardHandlerStack, KeySequenceMap} from 'neuroglancer/util/keyboard_shortcut_handler';
 import {NullarySignal} from 'neuroglancer/util/signal';
 import {CompoundTrackable} from 'neuroglancer/util/trackable';
 import {DataDisplayLayout, LAYOUTS} from 'neuroglancer/viewer_layouts';
-import {ViewerState} from 'neuroglancer/viewer_state';
+import {ViewerState, VisibilityPrioritySpecification} from 'neuroglancer/viewer_state';
+import {WatchableVisibilityPriority} from 'neuroglancer/visibility_priority/frontend';
+import {GL} from 'neuroglancer/webgl/context';
 import {RPC} from 'neuroglancer/worker_rpc';
 
 require('./viewer.css');
@@ -55,6 +57,40 @@ export function validateLayoutName(obj: any) {
   return layout[0];
 }
 
+export class DataManagementContext {
+  chunkQueueManager =
+      new ChunkQueueManager(new RPC(new Worker('chunk_worker.bundle.js')), this.gl, {
+        gpuMemory: new AvailableCapacity(1e6, 1e9),
+        systemMemory: new AvailableCapacity(1e7, 2e9),
+        download: new AvailableCapacity(32, Number.POSITIVE_INFINITY)
+      });
+  chunkManager = new ChunkManager(this.chunkQueueManager);
+
+  get rpc(): RPC {
+    return this.chunkQueueManager.rpc!;
+  }
+
+  constructor(public gl: GL) {}
+}
+
+export interface UIOptions {
+  showHelpButton: boolean;
+  showLayerDialog: boolean;
+  showLayerPanel: boolean;
+  showLocation: boolean;
+}
+
+export interface ViewerOptions extends UIOptions, VisibilityPrioritySpecification {
+  dataContext: DataManagementContext;
+}
+
+const defaultViewerOptions = {
+  showHelpButton: true,
+  showLayerDialog: true,
+  showLayerPanel: true,
+  showLocation: true,
+};
+
 export class Viewer extends RefCounted implements ViewerState {
   navigationState = this.registerDisposer(new NavigationState());
   perspectiveNavigationState = new NavigationState(new Pose(this.navigationState.position), 1);
@@ -68,36 +104,53 @@ export class Viewer extends RefCounted implements ViewerState {
   layerPanel: LayerPanel;
   layerSelectedValues =
       this.registerDisposer(new LayerSelectedValues(this.layerManager, this.mouseState));
-  worker = new RPC(new Worker('chunk_worker.bundle.js'));
   resetInitiated = new NullarySignal();
 
-  chunkQueueManager = new ChunkQueueManager(this.worker, this.display.gl, {
-    gpuMemory: new AvailableCapacity(1e6, 1e9),
-    systemMemory: new AvailableCapacity(1e7, 2e9),
-    download: new AvailableCapacity(32, Number.POSITIVE_INFINITY)
-  });
-  chunkManager = new ChunkManager(this.chunkQueueManager);
+  get chunkManager() {
+    return this.dataContext.chunkManager;
+  }
+  get chunkQueueManager() {
+    return this.dataContext.chunkQueueManager;
+  }
+
   keyMap = new KeySequenceMap();
   keyCommands = new Map<string, (this: Viewer) => void>();
-  layerSpecification = new LayerListSpecification(
-      this.layerManager, this.chunkManager, this.worker, this.layerSelectedValues,
-      this.navigationState.voxelSize);
+  layerSpecification: LayerListSpecification;
   layoutName = new TrackableValue<string>(LAYOUTS[0][0], validateLayoutName);
 
   state = new CompoundTrackable();
 
-  constructor(public display: DisplayContext) {
+  private options: ViewerOptions;
+
+  get dataContext() {
+    return this.options.dataContext;
+  }
+  get visibility() {
+    return this.options.visibility;
+  }
+
+  visible = true;
+
+  constructor(public display: DisplayContext, options: Partial<ViewerOptions> = {}) {
     super();
 
-    this.registerDisposer(display.updateStarted.add(() => { this.onUpdateDisplay(); }));
-    this.registerDisposer(display.updateFinished.add(() => { this.onUpdateDisplayFinished(); }));
+    const {
+      dataContext = new DataManagementContext(display.gl),
+      visibility = new WatchableVisibilityPriority(WatchableVisibilityPriority.VISIBLE),
+    } = options;
 
-    // Prevent contextmenu on rightclick, as this inteferes with our use
-    // of the right mouse button.
-    this.registerEventListener(document, 'contextmenu', (e: Event) => {
-      e.preventDefault();
-      return false;
-    });
+    this.options = {...defaultViewerOptions, ...options, dataContext, visibility};
+
+    this.layerSpecification = new LayerListSpecification(
+        this.layerManager, this.chunkManager, this.layerSelectedValues,
+        this.navigationState.voxelSize);
+
+    this.registerDisposer(display.updateStarted.add(() => {
+      this.onUpdateDisplay();
+    }));
+    this.registerDisposer(display.updateFinished.add(() => {
+      this.onUpdateDisplayFinished();
+    }));
 
     const {state} = this;
     state.add('layers', this.layerSpecification);
@@ -110,8 +163,9 @@ export class Viewer extends RefCounted implements ViewerState {
     state.add('showSlices', this.showPerspectiveSliceViews);
     state.add('layout', this.layoutName);
 
-    this.registerDisposer(
-      this.navigationState.changed.add(() => { this.handleNavigationStateChanged(); }));
+    this.registerDisposer(this.navigationState.changed.add(() => {
+      this.handleNavigationStateChanged();
+    }));
 
     this.layerManager.initializePosition(this.navigationState.position);
 
@@ -129,7 +183,7 @@ export class Viewer extends RefCounted implements ViewerState {
         this.perspectiveNavigationState.pose.orientation.reset();
         this.perspectiveNavigationState.zoomFactor.reset();
         this.resetInitiated.dispatch();
-        if (!overlaysOpen) {
+        if (!overlaysOpen && this.options.showLayerDialog && this.visibility.visible) {
           new LayerDialog(this.layerSpecification);
         }
       }
@@ -137,15 +191,17 @@ export class Viewer extends RefCounted implements ViewerState {
     this.layerManager.layersChanged.add(maybeResetState);
     maybeResetState();
 
-    this.registerDisposer(this.chunkQueueManager.visibleChunksChanged.add(
-        () => { this.layerSelectedValues.handleLayerChange(); }));
+    this.registerDisposer(this.dataContext.chunkQueueManager.visibleChunksChanged.add(() => {
+      this.layerSelectedValues.handleLayerChange();
+    }));
 
-    this.chunkQueueManager.visibleChunksChanged.add(() => { display.scheduleRedraw(); });
+    this.registerDisposer(this.dataContext.chunkQueueManager.visibleChunksChanged.add(() => {
+      if (this.visible) {
+        display.scheduleRedraw();
+      }
+    }));
 
     this.makeUI();
-
-    this.registerDisposer(
-        new GlobalKeyboardShortcutHandler(this.keyMap, this.onKeyCommand.bind(this)));
 
     this.layoutName.changed.add(() => {
       if (this.dataDisplayLayout !== undefined) {
@@ -156,8 +212,12 @@ export class Viewer extends RefCounted implements ViewerState {
     });
 
     let {keyCommands} = this;
-    keyCommands.set('toggle-layout', function() { this.toggleLayout(); });
-    keyCommands.set('snap', function() { this.navigationState.pose.snap(); });
+    keyCommands.set('toggle-layout', function() {
+      this.toggleLayout();
+    });
+    keyCommands.set('snap', function() {
+      this.navigationState.pose.snap();
+    });
     keyCommands.set('add-layer', function() {
       this.layerPanel.addLayerMenu();
       return true;
@@ -176,40 +236,94 @@ export class Viewer extends RefCounted implements ViewerState {
     }
 
     for (let command of ['recolor', 'clear-segments']) {
-      keyCommands.set(command, function() { this.layerManager.invokeAction(command); });
+      keyCommands.set(command, function() {
+        this.layerManager.invokeAction(command);
+      });
     }
 
-    keyCommands.set('toggle-axis-lines', function() { this.showAxisLines.toggle(); });
-    keyCommands.set('toggle-scale-bar', function() { this.showScaleBar.toggle(); });
-    this.keyCommands.set(
-        'toggle-show-slices', function() { this.showPerspectiveSliceViews.toggle(); });
+    keyCommands.set('toggle-axis-lines', function() {
+      this.showAxisLines.toggle();
+    });
+    keyCommands.set('toggle-scale-bar', function() {
+      this.showScaleBar.toggle();
+    });
+    this.keyCommands.set('toggle-show-slices', function() {
+      this.showPerspectiveSliceViews.toggle();
+    });
   }
 
   private makeUI() {
-    let {display} = this;
+    let {display, options} = this;
     let gridContainer = document.createElement('div');
     gridContainer.setAttribute('class', 'gllayoutcontainer noselect');
     let {container} = display;
     container.appendChild(gridContainer);
 
-    L.box('column', [
-      L.box(
-          'row',
-          [
-            L.withFlex(1, element => new PositionStatusPanel(element, this)),
-            element => {
-              let button = document.createElement('button');
-              button.className = 'help-button';
-              button.textContent = '?';
-              button.title = 'Help';
-              element.appendChild(button);
-              this.registerEventListener(button, 'click', () => { this.showHelpDialog(); });
-            },
-          ]),
-      element => { this.layerPanel = new LayerPanel(element, this.layerSpecification); },
-      L.withFlex(1, element => { this.createDataDisplayLayout(element); }),
-    ])(gridContainer);
+    let uiElements: L.Handler[] = [];
+
+    if (options.showHelpButton || options.showLocation) {
+      let rowElements: L.Handler[] = [];
+      if (options.showLocation) {
+        rowElements.push(L.withFlex(1, element => new PositionStatusPanel(element, this)));
+      }
+      if (options.showHelpButton) {
+        rowElements.push(element => {
+          let button = document.createElement('button');
+          button.className = 'help-button';
+          button.textContent = '?';
+          button.title = 'Help';
+          element.appendChild(button);
+          this.registerEventListener(button, 'click', () => {
+            this.showHelpDialog();
+          });
+        });
+      }
+      uiElements.push(L.box('row', rowElements));
+    }
+
+    if (options.showLayerPanel) {
+      uiElements.push(element => {
+        this.layerPanel = new LayerPanel(element, this.layerSpecification);
+      });
+    }
+
+    uiElements.push(L.withFlex(1, element => {
+      this.createDataDisplayLayout(element);
+    }));
+
+    L.box('column', uiElements)(gridContainer);
     this.display.onResize();
+
+    let keyboardHandlerDisposer: (() => void)|undefined;
+
+    const updateVisibility = () => {
+      const shouldBeVisible = this.visibility.visible;
+      if (shouldBeVisible) {
+        if (keyboardHandlerDisposer === undefined) {
+          keyboardHandlerDisposer =
+              globalKeyboardHandlerStack.push(this.keyMap, this.onKeyCommand.bind(this));
+        }
+        if (!this.visible) {
+          gridContainer.style.visibility = 'inherit';
+        }
+      } else if (!shouldBeVisible && this.visible) {
+        if (keyboardHandlerDisposer !== undefined) {
+          keyboardHandlerDisposer!();
+          keyboardHandlerDisposer = undefined;
+        }
+        if (this.visible) {
+          gridContainer.style.visibility = 'hidden';
+        }
+      }
+      this.visible = shouldBeVisible;
+    };
+    updateVisibility();
+    this.registerDisposer(() => {
+      if (keyboardHandlerDisposer !== undefined) {
+        keyboardHandlerDisposer();
+      }
+    });
+    this.registerDisposer(this.visibility.changed.add(updateVisibility));
   }
 
   createDataDisplayLayout(element: HTMLElement) {
@@ -224,15 +338,25 @@ export class Viewer extends RefCounted implements ViewerState {
     this.layoutName.value = newLayout[0];
   }
 
-  showHelpDialog() { new KeyBindingHelpDialog(this.keyMap); }
-
-  get gl() { return this.display.gl; }
-
-  onUpdateDisplay() {
-    this.chunkQueueManager.chunkUpdateDeadline = null;
+  showHelpDialog() {
+    new KeyBindingHelpDialog(this.keyMap);
   }
 
-  onUpdateDisplayFinished() { this.mouseState.updateIfStale(); }
+  get gl() {
+    return this.display.gl;
+  }
+
+  onUpdateDisplay() {
+    if (this.visible) {
+      this.dataContext.chunkQueueManager.chunkUpdateDeadline = null;
+    }
+  }
+
+  onUpdateDisplayFinished() {
+    if (this.visible) {
+      this.mouseState.updateIfStale();
+    }
+  }
 
   private onKeyCommand(action: string) {
     let command = this.keyCommands.get(action);
@@ -247,9 +371,11 @@ export class Viewer extends RefCounted implements ViewerState {
   }
 
   private handleNavigationStateChanged() {
-    let {chunkQueueManager} = this;
-    if (chunkQueueManager.chunkUpdateDeadline === null) {
-      chunkQueueManager.chunkUpdateDeadline = Date.now() + 10;
+    if (this.visible) {
+      let {chunkQueueManager} = this.dataContext;
+      if (chunkQueueManager.chunkUpdateDeadline === null) {
+        chunkQueueManager.chunkUpdateDeadline = Date.now() + 10;
+      }
     }
     this.mouseState.stale = true;
   }
