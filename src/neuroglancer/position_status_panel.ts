@@ -20,8 +20,6 @@ import {ViewerPositionState} from 'neuroglancer/viewer_state';
 
 require('./position_status_panel.css');
 
-const ROUND_POSITIONS = true;
-
 export class PositionStatusPanel extends RefCounted {
   private positionElements = new Array<HTMLInputElement>();
   private mouseElement: HTMLSpanElement;
@@ -128,18 +126,11 @@ export class PositionStatusPanel extends RefCounted {
       }
     }
 
-    let voxelSize = position.voxelSize;
-
     {
       let text = '';
       if (mouseState.active) {
-        voxelSize.voxelFromSpatial(voxelPosition, mouseState.position);
-        let p = voxelPosition;
-        if (ROUND_POSITIONS) {
-          text = `x ${Math.round(p[0])}  y ${Math.round(p[1])}  z ${Math.round(p[2])}`;
-        } else {
-          text = `x ${p[0].toFixed(2)}  y ${p[1].toFixed(2)}  z ${p[2].toFixed(2)}`;
-        }
+        let p = mouseState.position;
+        text = `x ${p[0].toFixed(0)} nm  y ${p[1].toFixed(0)} nm  z ${p[2].toFixed(0)} nm`;
       }
       this.mouseElement.textContent = text;
     }
