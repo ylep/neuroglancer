@@ -130,7 +130,7 @@ export class PositionStatusPanel extends RefCounted {
       let text = '';
       if (mouseState.active) {
         let p = mouseState.position;
-        text = `x ${p[0].toFixed(0)} nm  y ${p[1].toFixed(0)} nm  z ${p[2].toFixed(0)} nm`;
+        text = `x ${(p[0] * 1e-6).toFixed(6)}  y ${(p[1] * 1e-6).toFixed(6)}  z ${(p[2] * 1e-6).toFixed(6)} mm`;
       }
       this.mouseElement.textContent = text;
     }
