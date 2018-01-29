@@ -14,12 +14,19 @@
  * limitations under the License.
  */
 
-export class RenderSourceParameters {
+export class RenderBaseSourceParameters {
   baseUrls: string[];
   owner: string;
   project: string;
   stack: string;
-  encoding: string;
+  channel: string|undefined;
+}
+
+export class RenderSourceParameters extends RenderBaseSourceParameters {
+  minIntensity: number|undefined;
+  maxIntensity: number|undefined;
+  maxTileSpecsToRender: number|undefined;
+  filter: boolean|undefined;
 }
 
 export class TileChunkSourceParameters extends RenderSourceParameters {
@@ -28,11 +35,6 @@ export class TileChunkSourceParameters extends RenderSourceParameters {
   encoding: string;
 
   static RPC_ID = 'render/TileChunkSource';
-
-  static stringify(parameters: TileChunkSourceParameters) {
-    return `render:tile:${parameters.baseUrls[0]}/${parameters.owner}/${parameters.project}/` +
-        `${parameters.stack}/${parameters.level}/${parameters.encoding}`;
-  }
 }
 
 export class PointMatchChunkSourceParameters extends RenderSourceParameters {
@@ -40,9 +42,4 @@ export class PointMatchChunkSourceParameters extends RenderSourceParameters {
   zoffset: number;
 
   static RPC_ID = 'render/PointMatchSource';
-
-  static stringify(parameters: PointMatchChunkSourceParameters) {
-    return `render:pointmatch:${parameters.baseUrls[0]}/${parameters.owner}/` +
-        `${parameters.project}/${parameters.stack}/${parameters.matchCollection}`;
-  }
 }

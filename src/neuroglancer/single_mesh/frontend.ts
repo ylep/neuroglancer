@@ -15,13 +15,13 @@
  */
 
 import {ChunkState} from 'neuroglancer/chunk_manager/base';
-import {Chunk, ChunkManager, ChunkSource} from 'neuroglancer/chunk_manager/frontend';
+import {Chunk, ChunkManager, ChunkSource, WithParameters} from 'neuroglancer/chunk_manager/frontend';
 import {CoordinateTransform} from 'neuroglancer/coordinate_transform';
 import {PerspectiveViewRenderContext, PerspectiveViewRenderLayer} from 'neuroglancer/perspective_view/render_layer';
-import {GET_SINGLE_MESH_INFO_RPC_ID, SINGLE_MESH_CHUNK_KEY, SINGLE_MESH_LAYER_RPC_ID, SINGLE_MESH_SOURCE_RPC_ID, SingleMeshInfo, SingleMeshSourceParameters, VertexAttributeInfo} from 'neuroglancer/single_mesh/base';
+import {GET_SINGLE_MESH_INFO_RPC_ID, SINGLE_MESH_CHUNK_KEY, SINGLE_MESH_LAYER_RPC_ID, SingleMeshInfo, SingleMeshSourceParameters, SingleMeshSourceParametersWithInfo, VertexAttributeInfo} from 'neuroglancer/single_mesh/base';
 import {TrackableValue} from 'neuroglancer/trackable_value';
 import {DataType} from 'neuroglancer/util/data_type';
-import {mat4, vec2, vec3} from 'neuroglancer/util/geom';
+import {mat4, vec3} from 'neuroglancer/util/geom';
 import {parseArray, stableStringify, verifyOptionalString, verifyString} from 'neuroglancer/util/json';
 import {getObjectId} from 'neuroglancer/util/object_id';
 import {Uint64} from 'neuroglancer/util/uint64';
@@ -30,10 +30,10 @@ import {Buffer} from 'neuroglancer/webgl/buffer';
 import {GL} from 'neuroglancer/webgl/context';
 import {makeWatchableShaderError} from 'neuroglancer/webgl/dynamic_shader';
 import {CountingBuffer, countingBufferShaderModule, disableCountingBuffer, getCountingBuffer, IndexBufferAttributeHelper, makeIndexBuffer} from 'neuroglancer/webgl/index_emulation';
-import {compute1dTextureFormat, compute1dTextureLayout, OneDimensionalTextureAccessHelper, OneDimensionalTextureFormat, setOneDimensionalTextureData} from 'neuroglancer/webgl/one_dimensional_texture_access';
+import {compute1dTextureFormat, compute1dTextureLayout, OneDimensionalTextureAccessHelper, OneDimensionalTextureFormat, setOneDimensionalTextureData, TextureAccessCoefficients} from 'neuroglancer/webgl/one_dimensional_texture_access';
 import {ShaderBuilder, ShaderModule, ShaderProgram} from 'neuroglancer/webgl/shader';
 import {getShaderType, glsl_addUint32, glsl_divmodUint32, setVec4FromUint32} from 'neuroglancer/webgl/shader_lib';
-import {registerSharedObjectOwner, RPC, SharedObject} from 'neuroglancer/worker_rpc';
+import {SharedObject} from 'neuroglancer/worker_rpc';
 
 export const FRAGMENT_MAIN_START = '//NEUROGLANCER_SINGLE_MESH_LAYER_FRAGMENT_MAIN_START';
 
@@ -259,7 +259,7 @@ export class VertexChunkData {
   // Emulation of buffer as texture.
   dataWidth: number;
   textureHeight: number;
-  textureAccessCoefficients: vec2;
+  textureAccessCoefficients: TextureAccessCoefficients;
 
   copyToGPU(gl: GL, attributeFormats: OneDimensionalTextureFormat[]) {
     let numVertices = this.vertexPositions.length / 3;
@@ -324,27 +324,14 @@ export function getAttributeTextureFormats(vertexAttributes: VertexAttributeInfo
       x => compute1dTextureFormat(new OneDimensionalTextureFormat(), x.dataType, x.numComponents));
 }
 
-@registerSharedObjectOwner(SINGLE_MESH_SOURCE_RPC_ID)
-export class SingleMeshSource extends ChunkSource {
+export class SingleMeshSource extends
+(WithParameters(ChunkSource, SingleMeshSourceParametersWithInfo)) {
   attributeTextureFormats = getAttributeTextureFormats(this.info.vertexAttributes);
-  constructor(
-      chunkManager: ChunkManager, public parameters: SingleMeshSourceParameters,
-      public info: SingleMeshInfo) {
-    super(chunkManager);
-    if (info === undefined) {
-      throw new Error('Should not be undefined');
-    }
-  }
-  initializeCounterpart(rpc: RPC, options: any) {
-    options['parameters'] = this.parameters;
-    options['info'] = this.info;
-    super.initializeCounterpart(rpc, options);
-  }
+
+  get info () { return this.parameters.info; }
+
   getChunk(x: any) {
     return new SingleMeshChunk(this, x);
-  }
-  toString() {
-    return SingleMeshSourceParameters.stringify(this.parameters);
   }
 }
 
@@ -352,11 +339,11 @@ const SharedObjectWithSharedVisibility = withSharedVisibility(SharedObject);
 class SingleMeshLayerSharedObject extends SharedObjectWithSharedVisibility {}
 
 export class SingleMeshLayer extends PerspectiveViewRenderLayer {
-  private shaderManager: SingleMeshShaderManager|undefined;
+  protected shaderManager: SingleMeshShaderManager|undefined;
   private shaders = new Map<ShaderModule, ShaderProgram|null>();
   private sharedObject = this.registerDisposer(new SingleMeshLayerSharedObject());
   private fallbackFragmentMain = DEFAULT_FRAGMENT_MAIN;
-  private countingBuffer = this.registerDisposer(getCountingBuffer(this.gl));
+  protected countingBuffer = this.registerDisposer(getCountingBuffer(this.gl));
 
   constructor(public source: SingleMeshSource, public displayState: SingleMeshDisplayState) {
     super();
@@ -399,12 +386,12 @@ export class SingleMeshLayer extends PerspectiveViewRenderLayer {
     super.disposed();
   }
 
-  private makeShaderManager(fragmentMain = this.displayState.fragmentMain.value) {
+  protected makeShaderManager(fragmentMain = this.displayState.fragmentMain.value) {
     return new SingleMeshShaderManager(
         this.displayState.attributeNames.value, this.source.info.vertexAttributes, fragmentMain);
   }
 
-  private getShader(emitter: ShaderModule): ShaderProgram|null {
+  protected getShader(emitter: ShaderModule): ShaderProgram|null {
     let {shaders} = this;
     let shader = shaders.get(emitter);
     if (shader === undefined) {
@@ -515,8 +502,5 @@ function getSingleMeshInfo(chunkManager: ChunkManager, parameters: SingleMeshSou
 export function getSingleMeshSource(
     chunkManager: ChunkManager, parameters: SingleMeshSourceParameters) {
   return getSingleMeshInfo(chunkManager, parameters)
-      .then(
-          info => chunkManager.getChunkSource(
-              SingleMeshSource, stableStringify([parameters, info]),
-              () => new SingleMeshSource(chunkManager, parameters, info)));
+    .then(info => chunkManager.getChunkSource(SingleMeshSource, {parameters: {...parameters, info}}));
 }

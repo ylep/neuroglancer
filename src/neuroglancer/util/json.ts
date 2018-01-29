@@ -412,6 +412,21 @@ export function verifyOptionalInt(obj: any): number|undefined {
   return verifyInt(obj);
 }
 
+export function verifyOptionalBoolean(obj: any): boolean|undefined {
+  if (obj === undefined) {
+    return undefined;
+  }
+  if (typeof obj === 'boolean') {
+    return obj;
+  } else if (obj === 'true') {
+    return true;
+  } else if (obj === 'false') {
+    return false;
+  } else {
+    throw new Error(`Expected string or boolean but received: ${JSON.stringify(obj)}`);
+  }
+}
+
 export function verifyObjectProperty<T>(
     obj: any, propertyName: string, validator: (value: any) => T): T {
   let value = obj.hasOwnProperty(propertyName) ? obj[propertyName] : undefined;
@@ -509,4 +524,11 @@ export function verifyStringArray(a: any) {
     }
   }
   return <string[]>a;
+}
+
+export function verifyBoolean(x: any) {
+  if (typeof x !== 'boolean') {
+    throw new Error(`Expected boolean, received: ${JSON.stringify(x)}`);
+  }
+  return x;
 }

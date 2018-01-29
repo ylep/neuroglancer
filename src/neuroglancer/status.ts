@@ -64,7 +64,10 @@ export class StatusMessage {
     }
   }
   setVisible(value: boolean) {
-    this.timer = null;
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
     this.element.style.display = value ? 'block' : 'none';
   }
 
@@ -98,6 +101,12 @@ export class StatusMessage {
     const msg = new StatusMessage();
     msg.element.textContent = message;
     msg.setVisible(true);
+    return msg;
+  }
+
+  static showTemporaryMessage(message: string, closeAfter: number = 2000): StatusMessage {
+    const msg = this.showMessage(message);
+    setTimeout(() => msg.dispose(), closeAfter);
     return msg;
   }
 }

@@ -15,7 +15,6 @@
  */
 
 import {CoordinateTransform} from 'neuroglancer/coordinate_transform';
-import {getMeshSource, getSkeletonSource} from 'neuroglancer/datasource/factory';
 import {UserLayer, UserLayerDropdown} from 'neuroglancer/layer';
 import {LayerListSpecification, registerLayerType, registerVolumeLayerType} from 'neuroglancer/layer_specification';
 import {getVolumeWithStatusMessage} from 'neuroglancer/layer_specification';
@@ -31,13 +30,16 @@ import {SegmentationRenderLayer, SliceViewSegmentationDisplayState} from 'neurog
 import {trackableAlphaValue} from 'neuroglancer/trackable_alpha';
 import {TrackableBoolean, TrackableBooleanCheckbox} from 'neuroglancer/trackable_boolean';
 import {Uint64Set} from 'neuroglancer/uint64_set';
-import {parseArray, verifyObjectProperty, verifyOptionalString} from 'neuroglancer/util/json';
+import {parseArray, verifyObjectProperty, verifyOptionalString, verify3dVec} from 'neuroglancer/util/json';
 import {Uint64} from 'neuroglancer/util/uint64';
 import {makeWatchableShaderError} from 'neuroglancer/webgl/dynamic_shader';
 import {RangeWidget} from 'neuroglancer/widget/range';
 import {SegmentSetWidget} from 'neuroglancer/widget/segment_set_widget';
 import {ShaderCodeWidget} from 'neuroglancer/widget/shader_code_widget';
 import {Uint64EntryWidget} from 'neuroglancer/widget/uint64_entry_widget';
+import {SharedWatchableValue} from 'neuroglancer/shared_watchable_value';
+import {Bounds} from 'neuroglancer/segmentation_display_state/base';
+import {vec3} from 'neuroglancer/util/geom';
 
 require('neuroglancer/noselect.css');
 require('./segmentation_user_layer.css');
@@ -56,6 +58,7 @@ export class SegmentationUserLayer extends UserLayer {
         selectedAlpha: trackableAlphaValue(0.5),
         notSelectedAlpha: trackableAlphaValue(0),
         objectAlpha: trackableAlphaValue(1.0),
+        clipBounds: SharedWatchableValue.make<Bounds|undefined>(this.manager.worker, undefined),
         hideSegmentZero: new TrackableBoolean(true, true),
         visibleSegments: Uint64Set.makeWithCounterpart(this.manager.worker),
         segmentEquivalences: SharedDisjointUint64Sets.makeWithCounterpart(this.manager.worker),
@@ -112,7 +115,7 @@ export class SegmentationUserLayer extends UserLayer {
     let meshPath = this.meshPath = x['mesh'] === null ? null : verifyOptionalString(x['mesh']);
     let skeletonsPath = this.skeletonsPath = verifyOptionalString(x['skeletons']);
     if (volumePath !== undefined) {
-      getVolumeWithStatusMessage(manager.chunkManager, volumePath, {
+      getVolumeWithStatusMessage(manager.dataSourceProvider, manager.chunkManager, volumePath, {
         volumeType: VolumeType.SEGMENTATION
       }).then(volume => {
         if (!this.wasDisposed) {
@@ -128,22 +131,24 @@ export class SegmentationUserLayer extends UserLayer {
     }
 
     if (meshPath != null) {
-      getMeshSource(manager.chunkManager, meshPath).then(meshSource => {
-        if (!this.wasDisposed) {
-          this.addMesh(meshSource);
-        }
-      });
+      this.manager.dataSourceProvider.getMeshSource(manager.chunkManager, meshPath)
+          .then(meshSource => {
+            if (!this.wasDisposed) {
+              this.addMesh(meshSource);
+            }
+          });
     }
 
     if (skeletonsPath !== undefined) {
-      getSkeletonSource(manager.chunkManager, skeletonsPath).then(skeletonSource => {
-        if (!this.wasDisposed) {
-          let base = new SkeletonLayer(
-              manager.chunkManager, skeletonSource, manager.voxelSize, this.displayState);
-          this.addRenderLayer(new PerspectiveViewSkeletonLayer(base.addRef()));
-          this.addRenderLayer(new SliceViewPanelSkeletonLayer(/* transfer ownership */ base));
-        }
-      });
+      this.manager.dataSourceProvider.getSkeletonSource(manager.chunkManager, skeletonsPath)
+          .then(skeletonSource => {
+            if (!this.wasDisposed) {
+              let base = new SkeletonLayer(
+                  manager.chunkManager, skeletonSource, manager.voxelSize, this.displayState);
+              this.addRenderLayer(new PerspectiveViewSkeletonLayer(base.addRef()));
+              this.addRenderLayer(new SliceViewPanelSkeletonLayer(/* transfer ownership */ base));
+            }
+          });
     }
 
     verifyObjectProperty(x, 'equivalences', y => {
@@ -158,6 +163,20 @@ export class SegmentationUserLayer extends UserLayer {
           visibleSegments.add(segmentEquivalences.get(id));
         });
       }
+    });
+
+    verifyObjectProperty(x, 'clipBounds', y => {
+      if (y === undefined) {
+        return;
+      }
+      let center: vec3|undefined, size: vec3|undefined;
+      verifyObjectProperty(y, 'center', z => center = verify3dVec(z));
+      verifyObjectProperty(y, 'size', z => size = verify3dVec(z));
+      if (!center || !size) {
+        return;
+      }
+      let bounds = {center, size};
+      this.displayState.clipBounds.value = bounds;
     });
   }
 
@@ -182,6 +201,13 @@ export class SegmentationUserLayer extends UserLayer {
     let {segmentEquivalences} = this.displayState;
     if (segmentEquivalences.size > 0) {
       x['equivalences'] = segmentEquivalences.toJSON();
+    }
+    let {clipBounds} = this.displayState;
+    if (clipBounds.value) {
+      x['clipBounds'] = {
+        center: clipBounds.value.center,
+        size: clipBounds.value.size,
+      };
     }
     x['transform'] = this.displayState.objectToDataTransform.toJSON();
     x['skeletonShader'] = this.displayState.fragmentMain.toJSON();
@@ -270,19 +296,23 @@ class SegmentationDropdown extends UserLayerDropdown {
     {
       const checkbox =
           this.registerDisposer(new TrackableBooleanCheckbox(layer.displayState.hideSegmentZero));
-      checkbox.element.className = 'neuroglancer-segmentation-dropdown-hide-segment-zero noselect';
+      checkbox.element.className =
+          'neuroglancer-segmentation-dropdown-hide-segment-zero neuroglancer-noselect';
       const label = document.createElement('label');
-      label.className = 'neuroglancer-segmentation-dropdown-hide-segment-zero noselect';
+      label.className =
+          'neuroglancer-segmentation-dropdown-hide-segment-zero neuroglancer-noselect';
       label.appendChild(document.createTextNode('Hide segment ID 0'));
       label.appendChild(checkbox.element);
       element.appendChild(label);
     }
 
     this.addSegmentWidget.element.classList.add('add-segment');
-    this.addSegmentWidget.element.title = 'Add segment ID';
+    this.addSegmentWidget.element.title = 'Add one or more segment IDs';
     element.appendChild(this.registerDisposer(this.addSegmentWidget).element);
-    this.registerDisposer(this.addSegmentWidget.valueEntered.add((value: Uint64) => {
-      this.layer.displayState.visibleSegments.add(value);
+    this.registerDisposer(this.addSegmentWidget.valuesEntered.add((values: Uint64[]) => {
+      for (const value of values) {
+        this.layer.displayState.visibleSegments.add(value);
+      }
     }));
     element.appendChild(this.registerDisposer(this.visibleSegmentWidget).element);
 

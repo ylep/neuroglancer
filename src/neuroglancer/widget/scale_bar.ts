@@ -30,9 +30,8 @@
  */
 
 import {RefCounted} from 'neuroglancer/util/disposable';
-import {removeFromParent} from 'neuroglancer/util/dom';
-
-require('./scale_bar.css');
+import {GL} from 'neuroglancer/webgl/context';
+import {setTextureFromCanvas} from 'neuroglancer/webgl/texture';
 
 /**
  * Default set of allowed significand values.  1 is implicitly part of the set.
@@ -46,12 +45,12 @@ const DEFAULT_ALLOWED_SIGNIFICANDS = [
   10,
 ];
 
-interface LengthUnit {
+export interface LengthUnit {
   unit: string;
   lengthInNanometers: number;
 }
 
-const ALLOWED_UNITS: LengthUnit[] = [
+export const ALLOWED_UNITS: LengthUnit[] = [
   {unit: 'km', lengthInNanometers: 1e12},
   {unit: 'm', lengthInNanometers: 1e9},
   {unit: 'mm', lengthInNanometers: 1e6},
@@ -59,6 +58,19 @@ const ALLOWED_UNITS: LengthUnit[] = [
   {unit: 'nm', lengthInNanometers: 1},
   {unit: 'pm', lengthInNanometers: 1e-3},
 ];
+
+export function pickLengthUnit(lengthInNanometers: number) {
+  const numAllowedUnits = ALLOWED_UNITS.length;
+  let unit = ALLOWED_UNITS[numAllowedUnits - 1];
+  for (let i = 0; i < numAllowedUnits; ++i) {
+    const allowedUnit = ALLOWED_UNITS[i];
+    if (lengthInNanometers >= allowedUnit.lengthInNanometers) {
+      unit = allowedUnit;
+      break;
+    }
+  }
+  return unit;
+}
 
 export class ScaleBarDimensions {
   /**
@@ -70,12 +82,12 @@ export class ScaleBarDimensions {
   /**
    * The target length in pixels.  The closest
    */
-  targetLengthInPixels: number;
+  targetLengthInPixels: number = 0;
 
   /**
    * Pixel size in nanometers.
    */
-  nanometersPerPixel: number;
+  nanometersPerPixel: number = 0;
 
   // The following three fields are computed from the previous three fields.
 
@@ -127,16 +139,7 @@ export class ScaleBarDimensions {
     }
 
     const physicalNanometers = bestSignificand * tenToThePowerExponent;
-    const numAllowedUnits = ALLOWED_UNITS.length;
-    let unit = ALLOWED_UNITS[numAllowedUnits - 1];
-    for (let i = 0; i < numAllowedUnits; ++i) {
-      const allowedUnit = ALLOWED_UNITS[i];
-      if (physicalNanometers >= allowedUnit.lengthInNanometers) {
-        unit = allowedUnit;
-        break;
-      }
-    }
-
+    const unit = pickLengthUnit(physicalNanometers);
     this.lengthInPixels = Math.round(physicalNanometers / nanometersPerPixel);
     this.physicalUnit = unit.unit;
     this.physicalLength = physicalNanometers / unit.lengthInNanometers;
@@ -144,28 +147,60 @@ export class ScaleBarDimensions {
   }
 }
 
-export class ScaleBarWidget extends RefCounted {
-  element = document.createElement('div');
-  textNode = document.createTextNode('');
-  barElement = document.createElement('div');
-  constructor(public dimensions = new ScaleBarDimensions()) {
+function makeScaleBarTexture(dimensions: ScaleBarDimensions, gl: GL, texture: WebGLTexture|null) {
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d')!;
+  const textHeight = 15;
+  const font = `bold ${textHeight}px sans-serif`;
+  ctx.font = font;
+  ctx.fillStyle = 'white';
+  const text = `${dimensions.physicalLength} ${dimensions.physicalUnit}`;
+  const textMetrics = ctx.measureText(text);
+  const innerWidth = Math.max(dimensions.lengthInPixels, textMetrics.width);
+  const barHeight = 8;
+  const barTopMargin = 5;
+  const innerHeight = barHeight + barTopMargin + textHeight;
+  const padding = 2;
+  const totalHeight = innerHeight + 2 * padding;
+  const totalWidth = innerWidth + 2 * padding;
+  canvas.width = totalWidth;
+  canvas.height = totalHeight;
+  ctx.font = font;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+  ctx.fillRect(0, 0, totalWidth, totalHeight);
+  ctx.fillStyle = 'white';
+  ctx.fillText(text, totalWidth / 2, totalHeight - padding - barHeight - barTopMargin);
+  ctx.fillRect(padding, totalHeight - padding - barHeight, dimensions.lengthInPixels, barHeight);
+  setTextureFromCanvas(gl, texture, canvas);
+  return {width: totalWidth, height: totalHeight};
+}
+
+export class ScaleBarTexture extends RefCounted {
+  texture: WebGLTexture|null = null;
+  width = 0;
+  height = 0;
+  constructor(public gl: GL, public dimensions = new ScaleBarDimensions()) {
     super();
-    let {element, textNode, barElement} = this;
-    element.className = 'scale-bar-container';
-    element.appendChild(textNode);
-    element.appendChild(barElement);
-    barElement.className = 'scale-bar';
   }
 
   update() {
     let {dimensions} = this;
-    if (dimensions.update()) {
-      this.textNode.textContent = `${dimensions.physicalLength} ${dimensions.physicalUnit}`;
-      this.barElement.style.width = `${dimensions.lengthInPixels}px`;
+    let {texture} = this;
+    if (!dimensions.update() && texture !== null) {
+      return;
     }
+    if (texture === null) {
+      texture = this.texture = this.gl.createTexture();
+    }
+    const {width, height} = makeScaleBarTexture(dimensions, this.gl, texture);
+    this.width = width;
+    this.height = height;
   }
 
   disposed() {
-    removeFromParent(this.element);
+    this.gl.deleteTexture(this.texture);
+    this.texture = null;
+    super.disposed();
   }
 }

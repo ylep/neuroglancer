@@ -14,24 +14,46 @@
  * limitations under the License.
  */
 
-import {registerChunkSource} from 'neuroglancer/chunk_manager/backend';
+import {WithParameters} from 'neuroglancer/chunk_manager/backend';
 import {PointMatchChunkSourceParameters, TileChunkSourceParameters} from 'neuroglancer/datasource/render/base';
 import {ChunkDecoder} from 'neuroglancer/sliceview/backend_chunk_decoders';
 import {decodeJpegChunk} from 'neuroglancer/sliceview/backend_chunk_decoders/jpeg';
-import {ParameterizedVectorGraphicsChunkSource, VectorGraphicsChunk} from 'neuroglancer/sliceview/vector_graphics/backend';
-import {ParameterizedVolumeChunkSource, VolumeChunk} from 'neuroglancer/sliceview/volume/backend';
+import {VectorGraphicsChunk, VectorGraphicsChunkSource} from 'neuroglancer/sliceview/vector_graphics/backend';
+import {VolumeChunk, VolumeChunkSource} from 'neuroglancer/sliceview/volume/backend';
 import {CancellationToken} from 'neuroglancer/util/cancellation';
 import {Float32ArrayBuilder} from 'neuroglancer/util/float32array_builder';
 import {vec3} from 'neuroglancer/util/geom';
 import {openShardedHttpRequest, sendHttpJsonPostRequest, sendHttpRequest} from 'neuroglancer/util/http_request';
 import {parseArray, verify3dVec, verifyObject, verifyString} from 'neuroglancer/util/json';
+import {registerSharedObject} from 'neuroglancer/worker_rpc';
 
 let chunkDecoders = new Map<string, ChunkDecoder>();
 chunkDecoders.set('jpg', decodeJpegChunk);
 
-@registerChunkSource(TileChunkSourceParameters)
-export class TileChunkSource extends ParameterizedVolumeChunkSource<TileChunkSourceParameters> {
+@registerSharedObject() export class TileChunkSource extends
+(WithParameters(VolumeChunkSource, TileChunkSourceParameters)) {
   chunkDecoder = chunkDecoders.get(this.parameters.encoding)!;
+
+  queryString = (() => {
+    let {parameters} = this;
+    let query_params: string[] = [];
+    if (parameters.channel !== undefined) {
+      query_params.push('channels=' + parameters.channel);
+    }
+    if (parameters.minIntensity !== undefined) {
+      query_params.push(`minIntensity=${JSON.stringify(parameters.minIntensity)}`);
+    }
+    if (parameters.maxIntensity !== undefined) {
+      query_params.push(`maxIntensity=${JSON.stringify(parameters.maxIntensity)}`);
+    }
+    if (parameters.maxTileSpecsToRender !== undefined) {
+      query_params.push(`maxTileSpecsToRender=${JSON.stringify(parameters.maxTileSpecsToRender)}`);
+    }
+    if (parameters.filter !== undefined) {
+      query_params.push(`filter=${JSON.stringify(parameters.filter)}`);
+    }
+    return query_params.join('&');
+  })();
 
   download(chunk: VolumeChunk, cancellationToken: CancellationToken) {
     let {parameters} = this;
@@ -55,12 +77,11 @@ export class TileChunkSource extends ParameterizedVolumeChunkSource<TileChunkSou
 
     // GET
     // /v1/owner/{owner}/project/{project}/stack/{stack}/z/{z}/box/{x},{y},{width},{height},{scale}/jpeg-image
-    let path = `/render-ws/v1/owner/${parameters.owner}/project/${parameters.project}/` +
-        `stack/${parameters.stack}/z/${chunkPosition[2]}/` +
-        `box/${chunkPosition[0]},${chunkPosition[1]},${xTileSize},${yTileSize},${scale}/jpeg-image`;
+    let path = `/render-ws/v1/owner/${parameters.owner}/project/${parameters.project}/stack/${parameters.stack}/z/${chunkPosition[2]}/box/${chunkPosition[0]},${chunkPosition[1]},${xTileSize},${yTileSize},${scale}/jpeg-image`;
 
     return sendHttpRequest(
-               openShardedHttpRequest(parameters.baseUrls, path), 'arraybuffer', cancellationToken)
+               openShardedHttpRequest(parameters.baseUrls, path + '?' + this.queryString),
+               'arraybuffer', cancellationToken)
         .then(response => this.chunkDecoder(chunk, response));
   }
 }
@@ -154,9 +175,8 @@ function downloadPointMatchChunk(
       });
 }
 
-@registerChunkSource(PointMatchChunkSourceParameters)
-export class PointMatchSource extends
-    ParameterizedVectorGraphicsChunkSource<PointMatchChunkSourceParameters> {
+@registerSharedObject() export class PointMatchSource extends
+(WithParameters(VectorGraphicsChunkSource, PointMatchChunkSourceParameters)) {
   download(chunk: VectorGraphicsChunk, cancellationToken: CancellationToken): Promise<void> {
     let {parameters} = this;
     let {chunkGridPosition} = chunk;
