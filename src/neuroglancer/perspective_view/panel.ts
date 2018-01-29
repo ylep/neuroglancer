@@ -19,12 +19,12 @@ import {DisplayContext} from 'neuroglancer/display_context';
 import {makeRenderedPanelVisibleLayerTracker, MouseSelectionState} from 'neuroglancer/layer';
 import {PickIDManager} from 'neuroglancer/object_picking';
 import {PerspectiveViewRenderContext, PerspectiveViewRenderLayer} from 'neuroglancer/perspective_view/render_layer';
-import {RenderedDataPanel} from 'neuroglancer/rendered_data_panel';
+import {RenderedDataPanel, RenderedDataViewerState} from 'neuroglancer/rendered_data_panel';
 import {SliceView, SliceViewRenderHelper} from 'neuroglancer/sliceview/frontend';
 import {TrackableBoolean, TrackableBooleanCheckbox} from 'neuroglancer/trackable_boolean';
+import {ActionEvent, registerActionListener} from 'neuroglancer/util/event_action_map';
 import {kAxes, mat4, transformVectorByMat4, vec3, vec4} from 'neuroglancer/util/geom';
 import {startRelativeMouseDrag} from 'neuroglancer/util/mouse_drag';
-import {ViewerState} from 'neuroglancer/viewer_state';
 import {DepthBuffer, FramebufferConfiguration, makeTextureBuffers, OffscreenCopyHelper, TextureBuffer} from 'neuroglancer/webgl/offscreen';
 import {ShaderBuilder} from 'neuroglancer/webgl/shader';
 import {glsl_packFloat01ToFixedPoint, unpackFloat01FromFixedPoint} from 'neuroglancer/webgl/shader_lib';
@@ -32,7 +32,7 @@ import {glsl_packFloat01ToFixedPoint, unpackFloat01FromFixedPoint} from 'neurogl
 require('neuroglancer/noselect.css');
 require('./panel.css');
 
-export interface PerspectiveViewerState extends ViewerState {
+export interface PerspectiveViewerState extends RenderedDataViewerState {
   showSliceViews: TrackableBoolean;
   showSliceViewsCheckbox?: boolean;
 }
@@ -106,7 +106,7 @@ gl_FragColor = vec4(accum.rgb / accum.a, revealage);
 export class PerspectivePanel extends RenderedDataPanel {
   viewer: PerspectiveViewerState;
 
-  private visibleLayerTracker = makeRenderedPanelVisibleLayerTracker(
+  protected visibleLayerTracker = makeRenderedPanelVisibleLayerTracker(
       this.viewer.layerManager, PerspectiveViewRenderLayer, this);
 
   sliceViews = new Set<SliceView>();
@@ -115,20 +115,20 @@ export class PerspectivePanel extends RenderedDataPanel {
   modelViewMat = mat4.create();
   width = 0;
   height = 0;
-  private pickIDs = new PickIDManager();
+  protected pickIDs = new PickIDManager();
   private axesLineHelper = this.registerDisposer(AxesLineHelper.get(this.gl));
   sliceViewRenderHelper =
       this.registerDisposer(SliceViewRenderHelper.get(this.gl, perspectivePanelEmit));
 
-  private offscreenFramebuffer = this.registerDisposer(new FramebufferConfiguration(this.gl, {
+  protected offscreenFramebuffer = this.registerDisposer(new FramebufferConfiguration(this.gl, {
     colorBuffers: makeTextureBuffers(this.gl, OffscreenTextures.NUM_TEXTURES),
     depthBuffer: new DepthBuffer(this.gl)
   }));
 
-  private transparentConfiguration_: FramebufferConfiguration<TextureBuffer>|undefined;
+  protected transparentConfiguration_: FramebufferConfiguration<TextureBuffer>|undefined;
 
-  private offscreenCopyHelper = this.registerDisposer(OffscreenCopyHelper.get(this.gl));
-  private transparencyCopyHelper =
+  protected offscreenCopyHelper = this.registerDisposer(OffscreenCopyHelper.get(this.gl));
+  protected transparencyCopyHelper =
       this.registerDisposer(OffscreenCopyHelper.get(this.gl, defineTransparencyCopyShader, 2));
 
   constructor(context: DisplayContext, element: HTMLElement, viewer: PerspectiveViewerState) {
@@ -137,12 +137,35 @@ export class PerspectivePanel extends RenderedDataPanel {
       this.viewportChanged();
     }));
 
+    registerActionListener(element, 'translate-via-mouse-drag', (e: ActionEvent<MouseEvent>) => {
+      startRelativeMouseDrag(e.detail, (_event, deltaX, deltaY) => {
+        const temp = tempVec3;
+        const {projectionMat} = this;
+        const {width, height} = this;
+        const {position} = this.viewer.navigationState;
+        const pos = position.spatialCoordinates;
+        vec3.transformMat4(temp, pos, projectionMat);
+        temp[0] = 2 * deltaX / width;
+        temp[1] = -2 * deltaY / height;
+        vec3.transformMat4(pos, temp, this.inverseProjectionMat);
+        position.changed.dispatch();
+      });
+    });
+
+    registerActionListener(element, 'rotate-via-mouse-drag', (e: ActionEvent<MouseEvent>) => {
+      startRelativeMouseDrag(e.detail, (_event, deltaX, deltaY) => {
+        this.navigationState.pose.rotateRelative(kAxes[1], -deltaX / 4.0 * Math.PI / 180.0);
+        this.navigationState.pose.rotateRelative(kAxes[0], deltaY / 4.0 * Math.PI / 180.0);
+        this.viewer.navigationState.changed.dispatch();
+      });
+    });
+
     if (viewer.showSliceViewsCheckbox) {
       let showSliceViewsCheckbox =
           this.registerDisposer(new TrackableBooleanCheckbox(viewer.showSliceViews));
-      showSliceViewsCheckbox.element.className = 'perspective-panel-show-slice-views noselect';
+      showSliceViewsCheckbox.element.className = 'perspective-panel-show-slice-views neuroglancer-noselect';
       let showSliceViewsLabel = document.createElement('label');
-      showSliceViewsLabel.className = 'perspective-panel-show-slice-views noselect';
+      showSliceViewsLabel.className = 'perspective-panel-show-slice-views neuroglancer-noselect';
       showSliceViewsLabel.appendChild(document.createTextNode('Slices'));
       showSliceViewsLabel.appendChild(showSliceViewsCheckbox.element);
       this.element.appendChild(showSliceViewsLabel);
@@ -224,27 +247,6 @@ export class PerspectivePanel extends RenderedDataPanel {
     return true;
   }
 
-  startDragViewport(e: MouseEvent) {
-    startRelativeMouseDrag(e, (event, deltaX, deltaY) => {
-      if (event.shiftKey) {
-        const temp = tempVec3;
-        const {projectionMat} = this;
-        const {width, height} = this;
-        const {position} = this.viewer.navigationState;
-        const pos = position.spatialCoordinates;
-        vec3.transformMat4(temp, pos, projectionMat);
-        temp[0] = 2 * deltaX / width;
-        temp[1] = -2 * deltaY / height;
-        vec3.transformMat4(pos, temp, this.inverseProjectionMat);
-        position.changed.dispatch();
-      } else {
-        this.navigationState.pose.rotateRelative(kAxes[1], -deltaX / 4.0 * Math.PI / 180.0);
-        this.navigationState.pose.rotateRelative(kAxes[0], deltaY / 4.0 * Math.PI / 180.0);
-        this.viewer.navigationState.changed.dispatch();
-      }
-    });
-  }
-
   private get transparentConfiguration() {
     let transparentConfiguration = this.transparentConfiguration_;
     if (transparentConfiguration === undefined) {
@@ -257,11 +259,14 @@ export class PerspectivePanel extends RenderedDataPanel {
   }
 
   draw() {
-    let {width, height} = this;
-    if (!this.navigationState.valid || width === 0 || height === 0) {
+    if (!this.navigationState.valid) {
       return;
     }
     this.onResize();
+    let {width, height} = this;
+    if (width === 0 || height === 0) {
+      return;
+    }
 
     if (this.viewer.showSliceViews.value) {
       for (let sliceView of this.sliceViews) {
@@ -383,11 +388,14 @@ export class PerspectivePanel extends RenderedDataPanel {
         this.offscreenFramebuffer.colorBuffers[OffscreenTextures.COLOR].texture);
   }
 
-  private drawSliceViews(renderContext: PerspectiveViewRenderContext) {
+  protected drawSliceViews(renderContext: PerspectiveViewRenderContext) {
     let {sliceViewRenderHelper} = this;
     let {lightDirection, ambientLighting, directionalLighting, dataToDevice} = renderContext;
 
     for (let sliceView of this.sliceViews) {
+      if (sliceView.width === 0 || sliceView.height === 0) {
+        continue;
+      }
       let scalar = Math.abs(vec3.dot(lightDirection, sliceView.viewportAxes[2]));
       let factor = ambientLighting + scalar * directionalLighting;
       let mat = tempMat4;
@@ -405,7 +413,7 @@ export class PerspectivePanel extends RenderedDataPanel {
     }
   }
 
-  private drawAxisLines() {
+  protected drawAxisLines() {
     let {gl} = this;
     let mat = tempMat4;
     mat4.identity(mat);

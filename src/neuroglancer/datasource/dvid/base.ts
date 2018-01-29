@@ -28,10 +28,6 @@ export class DVIDSourceParameters {
 export class VolumeChunkSourceParameters extends DVIDSourceParameters {
   encoding: VolumeChunkEncoding;
   static RPC_ID = 'dvid/VolumeChunkSource';
-  static stringify(parameters: VolumeChunkSourceParameters) {
-    return `dvid:volume:${parameters['baseUrls'][0]}/` +
-        `${parameters['nodeKey']}/${parameters['dataInstanceKey']}`;
-  }
 }
 
 export enum TileEncoding {
@@ -44,10 +40,4 @@ export class TileChunkSourceParameters extends DVIDSourceParameters {
   encoding: TileEncoding;
 
   static RPC_ID = 'dvid/TileChunkSource';
-
-  static stringify(parameters: TileChunkSourceParameters) {
-    return `dvid:volume:${parameters['baseUrls'][0]}/${parameters['nodeKey']}/` +
-        `${parameters['dataInstanceKey']}/${parameters['dims']}/${parameters['level']}/` +
-        `${TileEncoding[parameters['encoding']]}`;
-  }
 }

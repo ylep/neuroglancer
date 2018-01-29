@@ -14,34 +14,35 @@
  * limitations under the License.
  */
 
-import {registerChunkSource} from 'neuroglancer/chunk_manager/backend';
+import {WithParameters} from 'neuroglancer/chunk_manager/backend';
 import {MeshSourceParameters, SkeletonSourceParameters, VolumeChunkEncoding, VolumeChunkSourceParameters} from 'neuroglancer/datasource/python/base';
-import {decodeTriangleVertexPositionsAndIndices, FragmentChunk, ManifestChunk, ParameterizedMeshSource} from 'neuroglancer/mesh/backend';
-import {decodeSkeletonVertexPositionsAndIndices, ParameterizedSkeletonSource, SkeletonChunk} from 'neuroglancer/skeleton/backend';
+import {decodeTriangleVertexPositionsAndIndices, FragmentChunk, ManifestChunk, MeshSource} from 'neuroglancer/mesh/backend';
+import {decodeSkeletonVertexPositionsAndIndices, SkeletonChunk, SkeletonSource} from 'neuroglancer/skeleton/backend';
 import {VertexAttributeInfo} from 'neuroglancer/skeleton/base';
 import {ChunkDecoder} from 'neuroglancer/sliceview/backend_chunk_decoders';
 import {decodeJpegChunk} from 'neuroglancer/sliceview/backend_chunk_decoders/jpeg';
 import {decodeNdstoreNpzChunk} from 'neuroglancer/sliceview/backend_chunk_decoders/ndstoreNpz';
 import {decodeRawChunk} from 'neuroglancer/sliceview/backend_chunk_decoders/raw';
-import {ParameterizedVolumeChunkSource, VolumeChunk} from 'neuroglancer/sliceview/volume/backend';
+import {VolumeChunk, VolumeChunkSource} from 'neuroglancer/sliceview/volume/backend';
 import {CancellationToken} from 'neuroglancer/util/cancellation';
 import {DATA_TYPE_BYTES} from 'neuroglancer/util/data_type';
 import {convertEndian16, convertEndian32, Endianness} from 'neuroglancer/util/endian';
-import {openShardedHttpRequest, sendHttpRequest} from 'neuroglancer/util/http_request';
+import {openHttpRequest, sendHttpRequest} from 'neuroglancer/util/http_request';
+import {registerSharedObject} from 'neuroglancer/worker_rpc';
 
 let chunkDecoders = new Map<VolumeChunkEncoding, ChunkDecoder>();
 chunkDecoders.set(VolumeChunkEncoding.NPZ, decodeNdstoreNpzChunk);
 chunkDecoders.set(VolumeChunkEncoding.JPEG, decodeJpegChunk);
 chunkDecoders.set(VolumeChunkEncoding.RAW, decodeRawChunk);
 
-@registerChunkSource(VolumeChunkSourceParameters)
-export class VolumeChunkSource extends ParameterizedVolumeChunkSource<VolumeChunkSourceParameters> {
+@registerSharedObject() export class PythonVolumeChunkSource extends
+(WithParameters(VolumeChunkSource, VolumeChunkSourceParameters)) {
   chunkDecoder = chunkDecoders.get(this.parameters['encoding'])!;
   encoding = VolumeChunkEncoding[this.parameters.encoding].toLowerCase();
 
   download(chunk: VolumeChunk, cancellationToken: CancellationToken) {
     let {parameters} = this;
-    let path = `/neuroglancer/${this.encoding}/${parameters.key}`;
+    let path = `/neuroglancer/${this.encoding}/${parameters.key}/${parameters.scaleKey}`;
     {
       // chunkPosition must not be captured, since it will be invalidated by the next call to
       // computeChunkBounds.
@@ -51,8 +52,7 @@ export class VolumeChunkSource extends ParameterizedVolumeChunkSource<VolumeChun
         path += `/${chunkPosition[i]},${chunkPosition[i] + chunkDataSize![i]}`;
       }
     }
-    return sendHttpRequest(
-               openShardedHttpRequest(parameters.baseUrls, path), 'arraybuffer', cancellationToken)
+    return sendHttpRequest(openHttpRequest(path), 'arraybuffer', cancellationToken)
         .then(response => this.chunkDecoder(chunk, response));
   }
 }
@@ -64,8 +64,8 @@ export function decodeFragmentChunk(chunk: FragmentChunk, response: ArrayBuffer)
       chunk, response, Endianness.LITTLE, /*vertexByteOffset=*/4, numVertices);
 }
 
-@registerChunkSource(MeshSourceParameters)
-export class MeshSource extends ParameterizedMeshSource<MeshSourceParameters> {
+@registerSharedObject() export class PythonMeshSource extends
+(WithParameters(MeshSource, MeshSourceParameters)) {
   download(chunk: ManifestChunk) {
     // No manifest chunk to download, as there is always only a single fragment.
     chunk.fragmentIds = [''];
@@ -75,9 +75,7 @@ export class MeshSource extends ParameterizedMeshSource<MeshSourceParameters> {
   downloadFragment(chunk: FragmentChunk, cancellationToken: CancellationToken) {
     let {parameters} = this;
     let requestPath = `/neuroglancer/mesh/${parameters.key}/${chunk.manifestChunk!.objectId}`;
-    return sendHttpRequest(
-               openShardedHttpRequest(parameters.baseUrls, requestPath), 'arraybuffer',
-               cancellationToken)
+    return sendHttpRequest(openHttpRequest(requestPath), 'arraybuffer', cancellationToken)
         .then(response => decodeFragmentChunk(chunk, response));
   }
 }
@@ -116,14 +114,12 @@ function decodeSkeletonChunk(
       /*indexByteOffset=*/curOffset, /*numEdges=*/numEdges);
 }
 
-@registerChunkSource(SkeletonSourceParameters)
-export class SkeletonSource extends ParameterizedSkeletonSource<SkeletonSourceParameters> {
+@registerSharedObject() export class PythonSkeletonSource extends
+(WithParameters(SkeletonSource, SkeletonSourceParameters)) {
   download(chunk: SkeletonChunk, cancellationToken: CancellationToken) {
     const {parameters} = this;
     let requestPath = `/neuroglancer/skeleton/${parameters.key}/${chunk.objectId}`;
-    return sendHttpRequest(
-               openShardedHttpRequest(parameters.baseUrls, requestPath), 'arraybuffer',
-               cancellationToken)
+    return sendHttpRequest(openHttpRequest(requestPath), 'arraybuffer', cancellationToken)
         .then(response => decodeSkeletonChunk(chunk, response, parameters.vertexAttributes));
   }
 }

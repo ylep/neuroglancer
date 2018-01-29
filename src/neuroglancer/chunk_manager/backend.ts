@@ -14,9 +14,11 @@
  * limitations under the License.
  */
 
-import {AvailableCapacity, CHUNK_MANAGER_RPC_ID, CHUNK_QUEUE_MANAGER_RPC_ID, ChunkPriorityTier, ChunkSourceParametersConstructor, ChunkState} from 'neuroglancer/chunk_manager/base';
+import {CHUNK_MANAGER_RPC_ID, CHUNK_QUEUE_MANAGER_RPC_ID, CHUNK_SOURCE_INVALIDATE_RPC_ID, ChunkPriorityTier, ChunkSourceParametersConstructor, ChunkState} from 'neuroglancer/chunk_manager/base';
+import {SharedWatchableValue} from 'neuroglancer/shared_watchable_value';
 import {CancellationToken, CancellationTokenSource} from 'neuroglancer/util/cancellation';
-import {Disposable} from 'neuroglancer/util/disposable';
+import {Disposable, RefCounted} from 'neuroglancer/util/disposable';
+import {Borrowed} from 'neuroglancer/util/disposable';
 import {LinkedListOperations} from 'neuroglancer/util/linked_list';
 import LinkedList0 from 'neuroglancer/util/linked_list.0';
 import LinkedList1 from 'neuroglancer/util/linked_list.1';
@@ -25,7 +27,7 @@ import {ComparisonFunction, PairingHeapOperations} from 'neuroglancer/util/pairi
 import PairingHeap0 from 'neuroglancer/util/pairing_heap.0';
 import PairingHeap1 from 'neuroglancer/util/pairing_heap.1';
 import {NullarySignal} from 'neuroglancer/util/signal';
-import {initializeSharedObjectCounterpart, registerSharedObject, RPC, SharedObject, SharedObjectCounterpart} from 'neuroglancer/worker_rpc';
+import {initializeSharedObjectCounterpart, registerRPC, registerSharedObject, registerSharedObjectOwner, RPC, SharedObject, SharedObjectCounterpart} from 'neuroglancer/worker_rpc';
 
 const DEBUG_CHUNK_UPDATES = false;
 
@@ -149,7 +151,7 @@ interface ChunkConstructor<T extends Chunk> {
  * also have a frontend-part, as well as other chunk sources, such as the GenericFileSource, that
  * has only a backend part.
  */
-export abstract class ChunkSourceBase extends SharedObject {
+export class ChunkSourceBase extends SharedObject {
   chunks: Map<string, Chunk> = new Map<string, Chunk>();
   freeChunks: Chunk[] = new Array<Chunk>();
 
@@ -170,17 +172,6 @@ export abstract class ChunkSourceBase extends SharedObject {
     chunk.source = this;
     return chunk;
   }
-
-  /**
-   * Begin downloading the specified the chunk.  The returned promise should resolve when the
-   * downloaded data has been successfully decoded and stored in the chunk, or rejected if the
-   * download or decoding fails.
-   *
-   * @param chunk Chunk to download.
-   * @param cancellationToken If this token is canceled, the download/decoding should be aborted if
-   * possible.
-   */
-  abstract download(chunk: Chunk, cancellationToken: CancellationToken): Promise<void>;
 
   /**
    * Adds the specified chunk to the chunk cache.
@@ -212,7 +203,25 @@ export abstract class ChunkSourceBase extends SharedObject {
   }
 }
 
-export abstract class ChunkSource extends ChunkSourceBase {
+export interface ChunkSourceBase {
+  /**
+   * Begin downloading the specified the chunk.  The returned promise should resolve when the
+   * downloaded data has been successfully decoded and stored in the chunk, or rejected if the
+   * download or decoding fails.
+   *
+   * Note: This method must be defined by subclasses.
+   *
+   * @param chunk Chunk to download.
+   * @param cancellationToken If this token is canceled, the download/decoding should be aborted if
+   * possible.
+   *
+   * TODO(jbms): Move this back to the class definition above and declare this abstract once mixins
+   * are compatible with abstract classes.
+   */
+  download(chunk: Chunk, cancellationToken: CancellationToken): Promise<void>;
+}
+
+export class ChunkSource extends ChunkSourceBase {
   constructor(rpc: RPC, options: any) {
     // No need to add a reference, since the owner counterpart will hold a reference to the owner
     // counterpart of chunkManager.
@@ -259,7 +268,7 @@ class ChunkPriorityQueue {
   private recentHead = new Chunk();
   constructor(
       private heapOperations: PairingHeapOperations<Chunk>,
-      private linkedListOperations: LinkedListOperations) {
+      private linkedListOperations: LinkedListOperations<Chunk>) {
     linkedListOperations.initializeHead(this.recentHead);
   }
 
@@ -368,6 +377,36 @@ function tryToFreeCapacity(
   return true;
 }
 
+class AvailableCapacity extends RefCounted {
+  currentSize: number = 0;
+  currentItems: number = 0;
+
+  capacityChanged = new NullarySignal();
+
+  constructor(
+      public itemLimit: Borrowed<SharedWatchableValue<number>>,
+      public sizeLimit: Borrowed<SharedWatchableValue<number>>) {
+    super();
+    this.registerDisposer(itemLimit.changed.add(this.capacityChanged.dispatch));
+    this.registerDisposer(sizeLimit.changed.add(this.capacityChanged.dispatch));
+  }
+
+  /**
+   * Adjust available capacity by the specified amounts.
+   */
+  adjust(items: number, size: number) {
+    this.currentItems -= items;
+    this.currentSize -= size;
+  }
+
+  get availableSize() {
+    return this.sizeLimit.value - this.currentSize;
+  }
+  get availableItems() {
+    return this.itemLimit.value - this.currentItems;
+  }
+}
+
 @registerSharedObject(CHUNK_QUEUE_MANAGER_RPC_ID)
 export class ChunkQueueManager extends SharedObjectCounterpart {
   gpuMemoryCapacity: AvailableCapacity;
@@ -407,9 +446,15 @@ export class ChunkQueueManager extends SharedObjectCounterpart {
 
   constructor(rpc: RPC, options: any) {
     super(rpc, options);
-    this.gpuMemoryCapacity = AvailableCapacity.fromObject(options['gpuMemoryCapacity']);
-    this.systemMemoryCapacity = AvailableCapacity.fromObject(options['systemMemoryCapacity']);
-    this.downloadCapacity = AvailableCapacity.fromObject(options['downloadCapacity']);
+    const getCapacity = (capacity: any) => {
+      const result = this.registerDisposer(
+          new AvailableCapacity(rpc.get(capacity['itemLimit']), rpc.get(capacity['sizeLimit'])));
+      result.capacityChanged.add(() => this.scheduleUpdate());
+      return result;
+    };
+    this.gpuMemoryCapacity = getCapacity(options['gpuMemoryCapacity']);
+    this.systemMemoryCapacity = getCapacity(options['systemMemoryCapacity']);
+    this.downloadCapacity = getCapacity(options['downloadCapacity']);
   }
 
   scheduleUpdate() {
@@ -538,7 +583,6 @@ export class ChunkQueueManager extends SharedObjectCounterpart {
     let promotionCandidates = this.gpuMemoryPromotionQueue.candidates();
     let evictionCandidates = this.gpuMemoryEvictionQueue.candidates();
     let capacity = this.gpuMemoryCapacity;
-    let visibleChunksChanged = false;
     while (true) {
       let promotionCandidate = promotionCandidates.next().value;
       if (promotionCandidate === undefined) {
@@ -553,9 +597,6 @@ export class ChunkQueueManager extends SharedObjectCounterpart {
         }
         this.copyChunkToGPU(promotionCandidate);
         this.updateChunkState(promotionCandidate, ChunkState.GPU_MEMORY);
-        if (priorityTier === ChunkPriorityTier.VISIBLE) {
-          visibleChunksChanged = true;
-        }
       }
     }
   }
@@ -593,7 +634,7 @@ export class ChunkQueueManager extends SharedObjectCounterpart {
 
   private processQueuePromotions_() {
     let queueManager = this;
-    function evict(chunk: Chunk) {
+    const evict = (chunk: Chunk) => {
       switch (chunk.state) {
         case ChunkState.DOWNLOADING:
           cancelChunkDownload(chunk);
@@ -606,8 +647,8 @@ export class ChunkQueueManager extends SharedObjectCounterpart {
           break;
       }
       // Note: After calling this, chunk may no longer be valid.
-      chunk.source!.chunkManager.queueManager.updateChunkState(chunk, ChunkState.QUEUED);
-    }
+      this.updateChunkState(chunk, ChunkState.QUEUED);
+    };
     let promotionCandidates = this.queuedPromotionQueue.candidates();
     let downloadEvictionCandidates = this.downloadEvictionQueue.candidates();
     let systemMemoryEvictionCandidates = this.systemMemoryEvictionQueue.candidates();
@@ -654,6 +695,23 @@ export class ChunkQueueManager extends SharedObjectCounterpart {
           `${this.numFailed}, DOWNLOAD: ${this.downloadCapacity}, ` +
           `MEM: ${this.systemMemoryCapacity}, GPU: ${this.gpuMemoryCapacity}`);
     }
+  }
+
+  invalidateSourceCache(source: ChunkSource) {
+    for (const chunk of source.chunks.values()) {
+      switch (chunk.state) {
+        case ChunkState.DOWNLOADING:
+          cancelChunkDownload(chunk);
+          break;
+        case ChunkState.SYSTEM_MEMORY_WORKER:
+          chunk.freeSystemMemory();
+          break;
+      }
+      // Note: After calling this, chunk may no longer be valid.
+      this.updateChunkState(chunk, ChunkState.QUEUED);
+    }
+    this.rpc!.invoke('Chunk.update', {'source': source.rpcId});
+    this.scheduleUpdate();
   }
 }
 
@@ -753,22 +811,23 @@ export class ChunkManager extends SharedObjectCounterpart {
   }
 }
 
+
 /**
- * Decorates final subclasses of ChunkSource.
- *
- * Defines the toString method based on the stringify method of the specified Parameters class.
- *
- * Calls registerSharedObject using parametersConstructor.RPC_ID.
+ * Mixin for adding a `parameters` member to a ChunkSource, and for registering the shared object
+ * type based on the `RPC_ID` member of the Parameters class.
  */
-export function registerChunkSource<Parameters>(
-    parametersConstructor: ChunkSourceParametersConstructor<Parameters>) {
-  return <T extends{parameters: Parameters}&SharedObjectCounterpart>(
-             target: {new (rpc: RPC, options: any): T}) => {
-    registerSharedObject(parametersConstructor.RPC_ID)(target);
-    target.prototype.toString = function(this: {parameters: Parameters}) {
-      return parametersConstructor.stringify(this.parameters);
-    };
-  };
+export function WithParameters<Parameters, TBase extends {new (...args: any[]): SharedObject}>(
+    Base: TBase, parametersConstructor: ChunkSourceParametersConstructor<Parameters>) {
+  @registerSharedObjectOwner(parametersConstructor.RPC_ID)
+  class C extends Base {
+    parameters: Parameters;
+    constructor(...args: any[]) {
+      super(...args);
+      const options = args[1];
+      this.parameters = options['parameters'];
+    }
+  }
+  return C;
 }
 
 /**
@@ -781,7 +840,7 @@ export interface ChunkRequester extends SharedObject { chunkManager: ChunkManage
  *
  * The resultant class implements `ChunkRequester`.
  */
-export function withChunkManager<T extends{new (...args: any[]): SharedObject}>(Base: T) {
+export function withChunkManager<T extends {new (...args: any[]): SharedObject}>(Base: T) {
   return class extends Base implements ChunkRequester {
     chunkManager: ChunkManager;
     constructor(...args: any[]) {
@@ -790,7 +849,12 @@ export function withChunkManager<T extends{new (...args: any[]): SharedObject}>(
       const options = args[1];
       // We don't increment the reference count, because our owner owns a reference to the
       // ChunkManager.
-      this.chunkManager = this.registerDisposer(<ChunkManager>rpc.get(options['chunkManager']));
+      this.chunkManager = <ChunkManager>rpc.get(options['chunkManager']);
     }
   };
 }
+
+registerRPC(CHUNK_SOURCE_INVALIDATE_RPC_ID, function(x) {
+  const source = <ChunkSource>this.get(x['id']);
+  source.chunkManager.queueManager.invalidateSourceCache(source);
+});

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+import debounce from 'lodash/debounce';
 import {ChunkState} from 'neuroglancer/chunk_manager/base';
 import {Chunk, ChunkManager, ChunkSource} from 'neuroglancer/chunk_manager/frontend';
 import {LayerManager} from 'neuroglancer/layer';
@@ -59,8 +60,6 @@ export class SliceView extends Base {
 
   visibleChunksStale = true;
 
-  visibleLayersStale = false;
-
   visibleLayerList = new Array<RenderLayer>();
 
   visibleLayers: Map<RenderLayer, any[]>;
@@ -80,19 +79,14 @@ export class SliceView extends Base {
     this.initializeCounterpart(rpc, {
       'chunkManager': chunkManager.rpcId,
     });
-    this.updateVisibleLayers();
-
     this.registerDisposer(navigationState.changed.add(() => {
       this.updateViewportFromNavigationState();
     }));
     this.updateViewportFromNavigationState();
 
     this.registerDisposer(layerManager.layersChanged.add(() => {
-      if (!this.visibleLayersStale) {
-        if (this.hasValidViewport) {
-          this.visibleLayersStale = true;
-          setTimeout(this.updateVisibleLayers.bind(this), 0);
-        }
+      if (this.hasValidViewport) {
+        this.updateVisibleLayers();
       }
     }));
 
@@ -103,6 +97,7 @@ export class SliceView extends Base {
         chunkManager.chunkQueueManager.visibleChunksChanged.add(this.viewChanged.dispatch));
 
     this.updateViewportFromNavigationState();
+    this.updateVisibleLayers();
   }
 
   private updateViewportFromNavigationState() {
@@ -114,11 +109,17 @@ export class SliceView extends Base {
     this.setViewportToDataMatrix(tempMat);
   }
 
-  updateVisibleLayers() {
+  private updateVisibleLayers = this.registerCancellable(debounce(() => {
+    this.updateVisibleLayersNow();
+  }, 0));
+
+  private updateVisibleLayersNow() {
+    if (this.wasDisposed) {
+      return false;
+    }
     if (!this.hasValidViewport) {
       return false;
     }
-    this.visibleLayersStale = false;
     let visibleLayers = this.visibleLayers;
     let rpc = this.rpc!;
     let rpcMessage: any = {'id': this.rpcId};
@@ -225,11 +226,8 @@ export class SliceView extends Base {
           /*func=*/gl.GREATER,
           /*ref=*/1,
           /*mask=*/1);
-      if (renderLayerNum === 1) {
-        // Turn on blending after the first layer.
-        gl.enable(gl.BLEND);
-        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-      }
+
+      renderLayer.setGLBlendMode(gl, renderLayerNum);
       renderLayer.draw(this);
       ++renderLayerNum;
     }
@@ -239,6 +237,7 @@ export class SliceView extends Base {
   }
 
   maybeUpdateVisibleChunks() {
+    this.updateVisibleLayers.flush();
     if (!this.visibleChunksStale && !this.visibleSourcesStale) {
       // console.log("Not updating visible chunks");
       return false;
@@ -281,16 +280,29 @@ export abstract class SliceViewChunkSource extends ChunkSource implements
     SliceViewChunkSourceInterface {
   chunks: Map<string, SliceViewChunk>;
 
-  constructor(chunkManager: ChunkManager, public spec: SliceViewChunkSpecification) {
-    super(chunkManager);
+  spec: SliceViewChunkSpecification;
+
+  constructor(chunkManager: ChunkManager, options: {spec: SliceViewChunkSpecification}) {
+    super(chunkManager, options);
+    this.spec = options.spec;
+  }
+
+  static encodeOptions(options: {spec: SliceViewChunkSpecification}) {
+    const encoding = super.encodeOptions(options);
+    encoding.spec = options.spec.toObject();
+    return encoding;
   }
 
   initializeCounterpart(rpc: RPC, options: any) {
     options['spec'] = this.spec.toObject();
     super.initializeCounterpart(rpc, options);
   }
+}
 
-  abstract getChunk(x: any): any
+export interface SliceViewChunkSource {
+  // TODO(jbms): Move this declaration to the class definition above and declare abstract once
+  // TypeScript supports mixins with abstact classes.
+  getChunk(x: any): any;
 }
 
 export abstract class SliceViewChunk extends Chunk {

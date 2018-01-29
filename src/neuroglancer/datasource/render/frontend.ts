@@ -19,22 +19,25 @@
  * Support for Render (https://github.com/saalfeldlab/render) servers.
  */
 
-import {ChunkManager} from 'neuroglancer/chunk_manager/frontend';
-import {CompletionResult, registerDataSourceFactory} from 'neuroglancer/datasource/factory';
+import {ChunkManager, WithParameters} from 'neuroglancer/chunk_manager/frontend';
+import {CompletionResult, DataSource} from 'neuroglancer/datasource';
 import {PointMatchChunkSourceParameters, TileChunkSourceParameters} from 'neuroglancer/datasource/render/base';
 import {VectorGraphicsChunkSpecification, VectorGraphicsSourceOptions} from 'neuroglancer/sliceview/vector_graphics/base';
-import {defineParameterizedVectorGraphicsSource, MultiscaleVectorGraphicsChunkSource as GenericMultiscaleVectorGraphicsChunkSource} from 'neuroglancer/sliceview/vector_graphics/frontend';
+import {MultiscaleVectorGraphicsChunkSource as GenericMultiscaleVectorGraphicsChunkSource, VectorGraphicsChunkSource} from 'neuroglancer/sliceview/vector_graphics/frontend';
 import {DataType, VolumeChunkSpecification, VolumeSourceOptions, VolumeType} from 'neuroglancer/sliceview/volume/base';
-import {defineParameterizedVolumeChunkSource, MultiscaleVolumeChunkSource as GenericMultiscaleVolumeChunkSource, VolumeChunkSource} from 'neuroglancer/sliceview/volume/frontend';
+import {MultiscaleVolumeChunkSource as GenericMultiscaleVolumeChunkSource, VolumeChunkSource} from 'neuroglancer/sliceview/volume/frontend';
 import {applyCompletionOffset, getPrefixMatchesWithDescriptions} from 'neuroglancer/util/completion';
 import {vec3} from 'neuroglancer/util/geom';
 import {openShardedHttpRequest, sendHttpRequest} from 'neuroglancer/util/http_request';
-import {parseArray, parseQueryStringParameters, verifyFloat, verifyInt, verifyObject, verifyObjectProperty, verifyOptionalInt, verifyOptionalString, verifyString} from 'neuroglancer/util/json';
+import {parseArray, parseQueryStringParameters, verifyFloat, verifyObject, verifyObjectProperty, verifyOptionalBoolean, verifyOptionalInt, verifyOptionalString, verifyString} from 'neuroglancer/util/json';
 
 const VALID_ENCODINGS = new Set<string>(['jpg']);
 
-const TileChunkSource = defineParameterizedVolumeChunkSource(TileChunkSourceParameters);
-const PointMatchSource = defineParameterizedVectorGraphicsSource(PointMatchChunkSourceParameters);
+const TileChunkSourceBase = WithParameters(VolumeChunkSource, TileChunkSourceParameters);
+class TileChunkSource extends TileChunkSourceBase {}
+const PointMatchSourceBase =
+    WithParameters(VectorGraphicsChunkSource, PointMatchChunkSourceParameters);
+class PointMatchSource extends PointMatchSourceBase {}
 
 const VALID_STACK_STATES = new Set<string>(['COMPLETE']);
 
@@ -52,6 +55,7 @@ interface StackInfo {
   upperVoxelBound: vec3;
   voxelResolution: vec3; /* in nm */
   project: string;
+  channels: string[];
 }
 
 function parseOwnerInfo(obj: any): OwnerInfo {
@@ -104,14 +108,21 @@ function parseStackInfo(obj: any): StackInfo|undefined {
     return undefined;
   }
 
-  let lowerVoxelBound: vec3 = verifyObjectProperty(obj, 'stats', parseLowerVoxelBounds);
-  let upperVoxelBound: vec3 = verifyObjectProperty(obj, 'stats', parseUpperVoxelBounds);
+  let stackStatsObj = verifyObjectProperty(obj, 'stats', verifyObject);
+
+  let lowerVoxelBound: vec3 = parseLowerVoxelBounds(stackStatsObj);
+  let upperVoxelBound: vec3 = parseUpperVoxelBounds(stackStatsObj);
+
+  let channels: string[] = [];
+  if (stackStatsObj.hasOwnProperty('channelNames')) {
+    channels = parseChannelNames(stackStatsObj);
+  }
 
   let voxelResolution: vec3 = verifyObjectProperty(obj, 'currentVersion', parseStackVersionInfo);
 
   let project: string = verifyObjectProperty(obj, 'stackId', parseStackProject);
 
-  return {lowerVoxelBound, upperVoxelBound, voxelResolution, project};
+  return {lowerVoxelBound, upperVoxelBound, voxelResolution, project, channels};
 }
 
 function parseUpperVoxelBounds(stackStatsObj: any): vec3 {
@@ -120,13 +131,9 @@ function parseUpperVoxelBounds(stackStatsObj: any): vec3 {
 
   let upperVoxelBound: vec3 = vec3.create();
 
-  upperVoxelBound[0] = verifyObjectProperty(stackBounds, 'maxX', verifyInt);
-  upperVoxelBound[1] = verifyObjectProperty(stackBounds, 'maxY', verifyInt);
-  upperVoxelBound[2] = verifyObjectProperty(stackBounds, 'maxZ', verifyInt);
-
-  for (let i = 0; i < 3; i++) {
-    upperVoxelBound[i] += 1;
-  }
+  upperVoxelBound[0] = verifyObjectProperty(stackBounds, 'maxX', verifyFloat);
+  upperVoxelBound[1] = verifyObjectProperty(stackBounds, 'maxY', verifyFloat);
+  upperVoxelBound[2] = verifyObjectProperty(stackBounds, 'maxZ', verifyFloat);
 
   return upperVoxelBound;
 }
@@ -137,11 +144,19 @@ function parseLowerVoxelBounds(stackStatsObj: any): vec3 {
 
   let lowerVoxelBound: vec3 = vec3.create();
 
-  lowerVoxelBound[0] = verifyObjectProperty(stackBounds, 'minX', verifyInt);
-  lowerVoxelBound[1] = verifyObjectProperty(stackBounds, 'minY', verifyInt);
-  lowerVoxelBound[2] = verifyObjectProperty(stackBounds, 'minZ', verifyInt);
+  lowerVoxelBound[0] = verifyObjectProperty(stackBounds, 'minX', verifyFloat);
+  lowerVoxelBound[1] = verifyObjectProperty(stackBounds, 'minY', verifyFloat);
+  lowerVoxelBound[2] = verifyObjectProperty(stackBounds, 'minZ', verifyFloat);
 
   return lowerVoxelBound;
+}
+
+function parseChannelNames(stackStatsObj: any): string[] {
+  verifyObject(stackStatsObj);
+
+  return verifyObjectProperty(stackStatsObj, 'channelNames', channelNamesObj => {
+    return parseArray(channelNamesObj, verifyString);
+  });
 }
 
 function parseStackVersionInfo(stackVersionObj: any): vec3 {
@@ -172,11 +187,12 @@ export class MultiscaleVolumeChunkSource implements GenericMultiscaleVolumeChunk
   }
   get numChannels() {
     return 3;
-  }  // TODO: parse RGB(A) vs single channel
+  }
   get volumeType() {
     return VolumeType.IMAGE;
   }
 
+  channel: string|undefined;
   stack: string;
   stackInfo: StackInfo;
 
@@ -185,9 +201,19 @@ export class MultiscaleVolumeChunkSource implements GenericMultiscaleVolumeChunk
   encoding: string;
   numLevels: number|undefined;
 
+  // Render Parameters
+  minIntensity: number|undefined;
+  maxIntensity: number|undefined;
+
+  // Force limited number of tile specs to render for downsampled views of large projects
+  maxTileSpecsToRender: number|undefined;
+
+  filter: boolean|undefined;
+
   constructor(
       public chunkManager: ChunkManager, public baseUrls: string[], public ownerInfo: OwnerInfo,
-      stack: string|undefined, public project: string, public parameters: {[index: string]: any}) {
+      stack: string|undefined, public project: string, channel: string|undefined,
+      public parameters: {[index: string]: any}) {
     let projectInfo = ownerInfo.projects.get(project);
     if (projectInfo === undefined) {
       throw new Error(
@@ -210,6 +236,15 @@ export class MultiscaleVolumeChunkSource implements GenericMultiscaleVolumeChunk
     }
     this.stack = stack;
     this.stackInfo = stackInfo;
+
+    if (channel !== undefined && channel.length > 0) {
+      this.channel = channel;
+    }
+
+    this.minIntensity = verifyOptionalInt(parameters['minIntensity']);
+    this.maxIntensity = verifyOptionalInt(parameters['maxIntensity']);
+    this.maxTileSpecsToRender = verifyOptionalInt(parameters['maxTileSpecsToRender']);
+    this.filter = verifyOptionalBoolean(parameters['filter']);
 
     let encoding = verifyOptionalString(parameters['encoding']);
     if (encoding === undefined) {
@@ -242,6 +277,15 @@ export class MultiscaleVolumeChunkSource implements GenericMultiscaleVolumeChunk
       numLevels = computeStackHierarchy(this.stackInfo, this.dims[0]);
     }
 
+    let lowerClipBound = vec3.create(), upperClipBound = vec3.create();
+    // Generate and set the clip bounds based on the highest resolution (lowest scale) data in
+    // render. Otherwise, rounding errors can cause inconsistencies in clip bounds between scaling
+    // levels.
+    for (let i = 0; i < 3; i++) {
+      lowerClipBound[i] = this.stackInfo.lowerVoxelBound[i] * this.stackInfo.voxelResolution[i];
+      upperClipBound[i] = this.stackInfo.upperVoxelBound[i] * this.stackInfo.voxelResolution[i];
+    }
+
     for (let level = 0; level < numLevels; level++) {
       let voxelSize = vec3.clone(this.stackInfo.voxelResolution);
       let chunkDataSize = vec3.fromValues(1, 1, 1);
@@ -265,19 +309,29 @@ export class MultiscaleVolumeChunkSource implements GenericMultiscaleVolumeChunk
         chunkDataSize,
         numChannels: this.numChannels,
         dataType: this.dataType,
+        lowerClipBound,
+        upperClipBound,
         lowerVoxelBound,
         upperVoxelBound,
         volumeSourceOptions,
       });
 
-      let source = TileChunkSource.get(this.chunkManager, spec, {
-        'baseUrls': this.baseUrls,
-        'owner': this.ownerInfo.owner,
-        'project': this.stackInfo.project,
-        'stack': this.stack,
-        'encoding': this.encoding,
-        'level': level,
-        'dims': `${this.dims[0]}_${this.dims[1]}`,
+      let source = this.chunkManager.getChunkSource(TileChunkSource, {
+        spec,
+        parameters: {
+          'baseUrls': this.baseUrls,
+          'owner': this.ownerInfo.owner,
+          'project': this.stackInfo.project,
+          'stack': this.stack,
+          'channel': this.channel,
+          'minIntensity': this.minIntensity,
+          'maxIntensity': this.maxIntensity,
+          'maxTileSpecsToRender': this.maxTileSpecsToRender,
+          'filter': this.filter,
+          'dims': `${this.dims[0]}_${this.dims[1]}`,
+          'level': level,
+          'encoding': this.encoding,
+        }
       });
 
       sources.push([source]);
@@ -300,6 +354,10 @@ export function computeStackHierarchy(stackInfo: StackInfo, tileSize: number) {
                                               maxBound = maxBound;
   }
 
+  if (tileSize >= maxBound) {
+    return 1;
+  }
+
   let counter = 0;
   while (maxBound > tileSize) {
     maxBound = maxBound / 2;
@@ -318,7 +376,7 @@ export function getOwnerInfo(
                 .then(parseOwnerInfo));
 }
 
-const pathPattern = /^([^\/?]+)(?:\/([^\/?]+))?(?:\/([^\/?]+))?(?:\?(.*))?$/;
+const pathPattern = /^([^\/?]+)(?:\/([^\/?]+))?(?:\/([^\/?]+))(?:\/([^\/?]*))?(?:\?(.*))?$/;
 
 export function getShardedVolume(chunkManager: ChunkManager, hostnames: string[], path: string) {
   const match = path.match(pathPattern);
@@ -328,15 +386,16 @@ export function getShardedVolume(chunkManager: ChunkManager, hostnames: string[]
   const owner = match[1];
   const project = match[2];
   const stack = match[3];
+  const channel = match[4];
 
-  const parameters = parseQueryStringParameters(match[4] || '');
+  const parameters = parseQueryStringParameters(match[5] || '');
 
   return chunkManager.memoize.getUncounted(
       {type: 'render:MultiscaleVolumeChunkSource', hostnames, path},
       () => getOwnerInfo(chunkManager, hostnames, owner)
                 .then(
                     ownerInfo => new MultiscaleVolumeChunkSource(
-                        chunkManager, hostnames, ownerInfo, stack, project, parameters)));
+                        chunkManager, hostnames, ownerInfo, stack, project, channel, parameters)));
 }
 
 const urlPattern = /^((?:(?:(?:http|https):\/\/[^,\/]+)[^\/?])+)\/(.*)$/;
@@ -352,7 +411,7 @@ export function getVolume(chunkManager: ChunkManager, path: string) {
 
 export function stackAndProjectCompleter(
     chunkManager: ChunkManager, hostnames: string[], path: string): Promise<CompletionResult> {
-  const stackMatch = path.match(/^(?:([^\/]+)(?:\/([^\/]*))?(?:\/([^\/]*))?)?$/);
+  const stackMatch = path.match(/^(?:([^\/]+)(?:\/([^\/]*))?(?:\/([^\/]*))?(\/.*?)?)?$/);
   if (stackMatch === null) {
     // URL has incorrect format, don't return any results.
     return Promise.reject<CompletionResult>(null);
@@ -362,23 +421,49 @@ export function stackAndProjectCompleter(
     return Promise.reject<CompletionResult>(null);
   }
   if (stackMatch[3] === undefined) {
-    // Try to complete the project
+    let projectPrefix = stackMatch[2] || '';
     return getOwnerInfo(chunkManager, hostnames, stackMatch[1]).then(ownerInfo => {
       let completions = getPrefixMatchesWithDescriptions(
-          stackMatch[2], ownerInfo.projects, x => x[0] + '/', () => undefined);
+          projectPrefix, ownerInfo.projects, x => x[0] + '/', () => undefined);
       return {offset: stackMatch[1].length + 1, completions};
     });
   }
+  if (stackMatch[4] === undefined) {
+    let stackPrefix = stackMatch[3] || '';
+    return getOwnerInfo(chunkManager, hostnames, stackMatch[1]).then(ownerInfo => {
+      let projectInfo = ownerInfo.projects.get(stackMatch[2]);
+      if (projectInfo === undefined) {
+        return Promise.reject<CompletionResult>(null);
+      }
+      let completions =
+          getPrefixMatchesWithDescriptions(stackPrefix, projectInfo.stacks, x => x[0] + '/', x => {
+            return `(${x[1].project})`;
+          });
+      return {offset: stackMatch[1].length + stackMatch[2].length + 2, completions};
+    });
+  }
+  let channelPrefix = stackMatch[4].substr(1) || '';
   return getOwnerInfo(chunkManager, hostnames, stackMatch[1]).then(ownerInfo => {
     let projectInfo = ownerInfo.projects.get(stackMatch[2]);
     if (projectInfo === undefined) {
       return Promise.reject<CompletionResult>(null);
     }
-    let completions =
-        getPrefixMatchesWithDescriptions(stackMatch[3], projectInfo.stacks, x => x[0], x => {
-          return `${x[1].project}`;
-        });
-    return {offset: stackMatch[1].length + stackMatch[2].length + 2, completions};
+    let stackInfo = projectInfo.stacks.get(stackMatch[3]);
+    if (stackInfo === undefined) {
+      return Promise.reject<CompletionResult>(null);
+    }
+    let channels = stackInfo.channels;
+    if (channels.length === 0) {
+      return Promise.reject<CompletionResult>(null);
+    } else {
+      // Try and complete the channel
+      let completions =
+          getPrefixMatchesWithDescriptions(channelPrefix, channels, x => x, () => undefined);
+      return {
+        offset: stackMatch[1].length + stackMatch[2].length + stackMatch[3].length + 3,
+        completions
+      };
+    }
   });
 }
 
@@ -476,14 +561,17 @@ export class MultiscaleVectorGraphicsChunkSource implements
 
     let spec = VectorGraphicsChunkSpecification.make(
         {voxelSize, lowerVoxelBound, upperVoxelBound, chunkDataSize, vectorGraphicsSourceOptions});
-    let source = PointMatchSource.get(this.chunkManager, spec, {
-      'baseUrls': this.baseUrls,
-      'owner': this.ownerInfo.owner,
-      'project': this.stackInfo.project,
-      'stack': this.stack,
-      'encoding': 'points',
-      'matchCollection': this.matchCollection,
-      'zoffset': this.zoffset
+    let source = this.chunkManager.getChunkSource(PointMatchSource, {
+      spec,
+      parameters: {
+        'baseUrls': this.baseUrls,
+        'owner': this.ownerInfo.owner,
+        'project': this.stackInfo.project,
+        'stack': this.stack,
+        'encoding': 'points',
+        'matchCollection': this.matchCollection,
+        'zoffset': this.zoffset
+      }
     });
 
     return [[source]];
@@ -520,9 +608,17 @@ export function getShardedPointMatches(
                         chunkManager, hostnames, ownerInfo, stack, project, parameters)));
 }
 
-registerDataSourceFactory('render', {
-  description: 'Render',
-  volumeCompleter: volumeCompleter,
-  getVolume: getVolume,
-  getVectorGraphicsSource: getPointMatches,
-});
+export class RenderDataSource extends DataSource {
+  get description() {
+    return 'Render';
+  }
+  getVolume(chunkManager: ChunkManager, url: string) {
+    return getVolume(chunkManager, url);
+  }
+  volumeCompleter(url: string, chunkManager: ChunkManager) {
+    return volumeCompleter(url, chunkManager);
+  }
+  getVectorGraphicsSource(chunkManager: ChunkManager, url: string) {
+    return getPointMatches(chunkManager, url);
+  }
+}
