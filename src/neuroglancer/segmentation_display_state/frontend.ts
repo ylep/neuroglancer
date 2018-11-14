@@ -20,6 +20,8 @@ import {LayerSelectedValues, UserLayer} from 'neuroglancer/layer';
 import {SegmentColorHash} from 'neuroglancer/segment_color';
 import {forEachVisibleSegment, getObjectKey, VisibleSegmentsState} from 'neuroglancer/segmentation_display_state/base';
 import {TrackableAlphaValue} from 'neuroglancer/trackable_alpha';
+import {Uint64Set} from 'neuroglancer/uint64_set';
+import {hsvToRgb, rgbToHsv} from 'neuroglancer/util/colorspace';
 import {RefCounted} from 'neuroglancer/util/disposable';
 import {vec4} from 'neuroglancer/util/geom';
 import {NullarySignal} from 'neuroglancer/util/signal';
@@ -80,6 +82,8 @@ export class SegmentSelectionState extends RefCounted {
 export interface SegmentationDisplayState extends VisibleSegmentsState {
   segmentSelectionState: SegmentSelectionState;
   segmentColorHash: SegmentColorHash;
+  saturation: TrackableAlphaValue;
+  highlightedSegments: Uint64Set;
 }
 
 export interface SegmentationDisplayStateWithAlpha extends SegmentationDisplayState {
@@ -95,6 +99,7 @@ export function registerRedrawWhenSegmentationDisplayStateChanged(
   const dispatchRedrawNeeded = renderLayer.redrawNeeded.dispatch;
   renderLayer.registerDisposer(displayState.segmentColorHash.changed.add(dispatchRedrawNeeded));
   renderLayer.registerDisposer(displayState.visibleSegments.changed.add(dispatchRedrawNeeded));
+  renderLayer.registerDisposer(displayState.highlightedSegments.changed.add(dispatchRedrawNeeded));
   renderLayer.registerDisposer(displayState.segmentEquivalences.changed.add(dispatchRedrawNeeded));
   renderLayer.registerDisposer(
       displayState.segmentSelectionState.changed.add(dispatchRedrawNeeded));
@@ -134,6 +139,26 @@ export function getObjectColor(
       color[i] = color[i] * 0.5 + 0.5;
     }
   }
+
+  // Apply saturation
+  let hsv = new Float32Array(3);
+  rgbToHsv(hsv, color[0], color[1], color[2]);
+  hsv[1] *= displayState.saturation.value;
+  let rgb = new Float32Array(3);
+  hsvToRgb(rgb, hsv[0], hsv[1], hsv[2]);
+  color[0] = rgb[0];
+  color[1] = rgb[1];
+  color[2] = rgb[2];
+
+  // Color highlighted segments
+  if(displayState.highlightedSegments.has(objectId)) {
+    // Make it vivid blue for selection
+    color[0] = 0.2;
+    color[1] = 0.2;
+    color[2] = 2.0;
+    color[3] = 1.0;
+  }
+
   color[0] *= alpha;
   color[1] *= alpha;
   color[2] *= alpha;
@@ -156,7 +181,6 @@ const Base = withSharedVisibility(SharedObject);
 export class SegmentationLayerSharedObject extends Base {
   constructor(public chunkManager: ChunkManager, public displayState: SegmentationDisplayState) {
     super();
-    this.registerDisposer(displayState.clipBounds.changed.add(() => chunkManager.chunkQueueManager.scheduleChunkUpdate()));
   }
 
   initializeCounterpartWithChunkManager(options: any) {

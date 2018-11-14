@@ -14,23 +14,31 @@
  * limitations under the License.
  */
 
+import {Annotation} from 'neuroglancer/annotation';
+import {getSelectedAnnotation} from 'neuroglancer/annotation/selection';
+import {getAnnotationTypeRenderHandler} from 'neuroglancer/annotation/type_handler';
 import {DisplayContext, RenderedPanel} from 'neuroglancer/display_context';
 import {MouseSelectionState} from 'neuroglancer/layer';
 import {NavigationState} from 'neuroglancer/navigation_state';
+import {UserLayerWithAnnotations} from 'neuroglancer/ui/annotations';
 import {AutomaticallyFocusedElement} from 'neuroglancer/util/automatic_focus';
 import {ActionEvent, EventActionMap, registerActionListener} from 'neuroglancer/util/event_action_map';
-import {AXES_NAMES, kAxes, vec3} from 'neuroglancer/util/geom';
+import {AXES_NAMES, kAxes, vec2, vec3} from 'neuroglancer/util/geom';
 import {KeyboardEventBinder} from 'neuroglancer/util/keyboard_bindings';
 import {MouseEventBinder} from 'neuroglancer/util/mouse_bindings';
+import {startRelativeMouseDrag} from 'neuroglancer/util/mouse_drag';
 import {getWheelZoomAmount} from 'neuroglancer/util/wheel_zoom';
 import {ViewerState} from 'neuroglancer/viewer_state';
+
 
 require('./rendered_data_panel.css');
 require('neuroglancer/noselect.css');
 
 const tempVec3 = vec3.create();
 
-export interface RenderedDataViewerState extends ViewerState { inputEventMap: EventActionMap; }
+export interface RenderedDataViewerState extends ViewerState {
+  inputEventMap: EventActionMap;
+}
 
 export abstract class RenderedDataPanel extends RenderedPanel {
   // Last mouse position within the panel.
@@ -44,6 +52,7 @@ export abstract class RenderedDataPanel extends RenderedPanel {
   inputEventMap: EventActionMap;
 
   navigationState: NavigationState;
+
 
   constructor(
       context: DisplayContext, element: HTMLElement, public viewer: RenderedDataViewerState) {
@@ -71,6 +80,10 @@ export abstract class RenderedDataPanel extends RenderedPanel {
 
     registerActionListener(element, 'zoom-out', () => {
       this.navigationState.zoomBy(2.0);
+    });
+
+    registerActionListener(element, 'highlight', () => {
+      this.viewer.layerManager.invokeAction('highlight');
     });
 
     for (let axis = 0; axis < 3; ++axis) {
@@ -122,7 +135,75 @@ export abstract class RenderedDataPanel extends RenderedPanel {
     });
 
     registerActionListener(element, 'snap', () => this.navigationState.pose.snap());
+
+    registerActionListener(element, 'select-annotation', () => {
+      const {mouseState, layerManager} = this.viewer;
+      const state = getSelectedAnnotation(mouseState, layerManager);
+      if (state === undefined) {
+        return;
+      }
+      const userLayer = state.layer.layer;
+      if (userLayer !== null) {
+        this.viewer.selectedLayer.layer = state.layer;
+        this.viewer.selectedLayer.visible = true;
+        userLayer.tabs.value = 'annotations';
+        (<UserLayerWithAnnotations>userLayer).selectedAnnotation.value = {
+          id: state.id,
+          partIndex: state.partIndex
+        };
+      }
+    });
+
+    registerActionListener(element, 'move-annotation', (e: ActionEvent<MouseEvent>) => {
+      const {mouseState} = this.viewer;
+      const selectedAnnotationId = mouseState.pickedAnnotationId;
+      const annotationLayer = mouseState.pickedAnnotationLayer;
+      if (annotationLayer !== undefined) {
+        if (selectedAnnotationId !== undefined) {
+          e.stopPropagation();
+          let annotationRef = annotationLayer.source.getReference(selectedAnnotationId)!;
+          let ann = <Annotation>annotationRef.value;
+
+          const handler = getAnnotationTypeRenderHandler(ann.type);
+          const pickedOffset = mouseState.pickedOffset;
+          let repPoint = handler.getRepresentativePoint(
+              annotationLayer.objectToGlobal, ann, mouseState.pickedOffset);
+          let totDeltaVec = vec2.set(vec2.create(), 0, 0);
+          if (mouseState.updateUnconditionally()) {
+            startRelativeMouseDrag(
+                e.detail,
+                (_event, deltaX, deltaY) => {
+                  vec2.add(totDeltaVec, totDeltaVec, [deltaX, deltaY]);
+                  let newRepPt = this.translateDataPointByViewportPixels(
+                      vec3.create(), repPoint, totDeltaVec[0], totDeltaVec[1]);
+                  let newAnnotation = handler.updateViaRepresentativePoint(
+                      ann, newRepPt, annotationLayer.globalToObject, pickedOffset);
+                  annotationLayer.source.update(annotationRef, newAnnotation);
+                },
+                (_event) => {
+                  annotationRef.dispose();
+                });
+          }
+        }
+      }
+    });
+
+    registerActionListener(element, 'delete-annotation', () => {
+      const {mouseState} = this.viewer;
+      const selectedAnnotationId = mouseState.pickedAnnotationId;
+      const annotationLayer = mouseState.pickedAnnotationLayer;
+      if (annotationLayer !== undefined && !annotationLayer.source.readonly &&
+        selectedAnnotationId !== undefined) {
+          const ref = annotationLayer.source.getReference(selectedAnnotationId);
+          try {
+            annotationLayer.source.delete(ref);
+          } finally {
+            ref.dispose();
+          }
+      }
+    });
   }
+
 
   onMouseout(_event: MouseEvent) {
     let {mouseState} = this.viewer;
@@ -138,6 +219,8 @@ export abstract class RenderedDataPanel extends RenderedPanel {
     this.mouseX = event.offsetX - element.clientLeft;
     this.mouseY = event.offsetY - element.clientTop;
     let {mouseState} = this.viewer;
+    mouseState.pageX = event.pageX;
+    mouseState.pageY = event.pageY;
     mouseState.updater = this.mouseStateUpdater;
     mouseState.triggerUpdate();
   }

@@ -16,6 +16,7 @@
 
 import debounce from 'lodash/debounce';
 import {RefCounted} from 'neuroglancer/util/disposable';
+import {vec3} from 'neuroglancer/util/geom';
 import {NullarySignal} from 'neuroglancer/util/signal';
 import {WatchableVisibilityPriority} from 'neuroglancer/visibility_priority/frontend';
 import {GL, initializeWebGL} from 'neuroglancer/webgl/context';
@@ -31,7 +32,9 @@ export abstract class RenderedPanel extends RefCounted {
   }
 
   scheduleRedraw() {
-    this.context.scheduleRedraw();
+    if (this.visible) {
+      this.context.scheduleRedraw();
+    }
   }
 
   abstract isReady(): boolean;
@@ -40,9 +43,11 @@ export abstract class RenderedPanel extends RefCounted {
     let element = this.element;
     const clientRect = element.getBoundingClientRect();
     const canvasRect = this.context.canvasRect!;
-    let left = element.clientLeft + clientRect.left - canvasRect.left;
+    const scaleX = canvasRect.width / this.context.canvas.width;
+    const scaleY = canvasRect.height / this.context.canvas.height;
+    let left = (element.clientLeft + clientRect.left - canvasRect.left) * scaleX;
     let width = element.clientWidth;
-    let top = clientRect.top - canvasRect.top + element.clientTop;
+    let top = (clientRect.top - canvasRect.top + element.clientTop) * scaleY;
     let height = element.clientHeight;
     let bottom = top + height;
     let gl = this.gl;
@@ -55,6 +60,9 @@ export abstract class RenderedPanel extends RefCounted {
   abstract onResize(): void;
 
   abstract draw(): void;
+
+  abstract translateDataPointByViewportPixels(
+      out: vec3, orig: vec3, deltaX: number, deltaY: number): vec3;
 
   disposed() {
     this.context.removePanel(this);

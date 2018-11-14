@@ -14,10 +14,8 @@
  * limitations under the License.
  */
 
-import {CoordinateTransform} from 'neuroglancer/coordinate_transform';
-import {UserLayer, UserLayerDropdown} from 'neuroglancer/layer';
+import {UserLayer} from 'neuroglancer/layer';
 import {LayerListSpecification, registerLayerType, registerVolumeLayerType} from 'neuroglancer/layer_specification';
-import {getVolumeWithStatusMessage} from 'neuroglancer/layer_specification';
 import {MeshSource} from 'neuroglancer/mesh/frontend';
 import {MeshLayer} from 'neuroglancer/mesh/frontend';
 import {Overlay} from 'neuroglancer/overlay';
@@ -33,6 +31,7 @@ import {trackableAlphaValue} from 'neuroglancer/trackable_alpha';
 import {ElementVisibilityFromTrackableBoolean, TrackableBoolean, TrackableBooleanCheckbox} from 'neuroglancer/trackable_boolean';
 import {ComputedWatchableValue} from 'neuroglancer/trackable_value';
 import {Uint64Set} from 'neuroglancer/uint64_set';
+import {UserLayerWithVolumeSourceMixin} from 'neuroglancer/user_layer_with_volume_source';
 import {Borrowed} from 'neuroglancer/util/disposable';
 import {vec3} from 'neuroglancer/util/geom';
 import {parseArray, verify3dVec, verifyObjectProperty, verifyOptionalString} from 'neuroglancer/util/json';
@@ -42,6 +41,7 @@ import {makeWatchableShaderError} from 'neuroglancer/webgl/dynamic_shader';
 import {RangeWidget} from 'neuroglancer/widget/range';
 import {SegmentSetWidget} from 'neuroglancer/widget/segment_set_widget';
 import {ShaderCodeWidget} from 'neuroglancer/widget/shader_code_widget';
+import {Tab} from 'neuroglancer/widget/tab_view';
 import {Uint64EntryWidget} from 'neuroglancer/widget/uint64_entry_widget';
 
 require('neuroglancer/noselect.css');
@@ -50,26 +50,37 @@ require('./segmentation_user_layer.css');
 const SELECTED_ALPHA_JSON_KEY = 'selectedAlpha';
 const NOT_SELECTED_ALPHA_JSON_KEY = 'notSelectedAlpha';
 const OBJECT_ALPHA_JSON_KEY = 'objectAlpha';
+const SATURATION_JSON_KEY = 'saturation';
 const HIDE_SEGMENT_ZERO_JSON_KEY = 'hideSegmentZero';
+const MESH_JSON_KEY = 'mesh';
+const SKELETONS_JSON_KEY = 'skeletons';
+const SEGMENTS_JSON_KEY = 'segments';
+const HIGHLIGHTS_JSON_KEY = 'highlights';
+const EQUIVALENCES_JSON_KEY = 'equivalences';
+const CLIP_BOUNDS_JSON_KEY = 'clipBounds';
+const SKELETON_SHADER_JSON_KEY = 'skeletonShader';
+const COLOR_SEED_JSON_KEY = 'colorSeed';
 
 
-export class SegmentationUserLayer extends UserLayer {
+const Base = UserLayerWithVolumeSourceMixin(UserLayer);
+export class SegmentationUserLayer extends Base {
   displayState: SliceViewSegmentationDisplayState&SegmentationDisplayState3D&
       SkeletonLayerDisplayState = {
         segmentColorHash: SegmentColorHash.getDefault(),
         segmentSelectionState: new SegmentSelectionState(),
         selectedAlpha: trackableAlphaValue(0.5),
+        saturation: trackableAlphaValue(1.0),
         notSelectedAlpha: trackableAlphaValue(0),
         objectAlpha: trackableAlphaValue(1.0),
         clipBounds: SharedWatchableValue.make<Bounds|undefined>(this.manager.worker, undefined),
         hideSegmentZero: new TrackableBoolean(true, true),
         visibleSegments: Uint64Set.makeWithCounterpart(this.manager.worker),
+        highlightedSegments: Uint64Set.makeWithCounterpart(this.manager.worker),
         segmentEquivalences: SharedDisjointUint64Sets.makeWithCounterpart(this.manager.worker),
-        objectToDataTransform: new CoordinateTransform(),
+        objectToDataTransform: this.transform,
         fragmentMain: getTrackableFragmentMain(),
         shaderError: makeWatchableShaderError(),
       };
-  volumePath: string|undefined;
 
   /**
    * If meshPath is undefined, a default mesh source provided by the volume may be used.  If
@@ -84,46 +95,108 @@ export class SegmentationUserLayer extends UserLayer {
   objectLayerStateChanged = new NullarySignal();
 
   constructor(public manager: LayerListSpecification, x: any) {
-    super([]);
-    this.displayState.visibleSegments.changed.add(() => {
-      this.specificationChanged.dispatch();
-    });
-    this.displayState.segmentEquivalences.changed.add(() => {
-      this.specificationChanged.dispatch();
-    });
+    super(manager, x);
+    this.displayState.visibleSegments.changed.add(this.specificationChanged.dispatch);
+    this.displayState.segmentEquivalences.changed.add(this.specificationChanged.dispatch);
     this.displayState.segmentSelectionState.bindTo(manager.layerSelectedValues, this);
-    this.displayState.selectedAlpha.changed.add(() => {
-      this.specificationChanged.dispatch();
+    this.displayState.selectedAlpha.changed.add(this.specificationChanged.dispatch);
+    this.displayState.notSelectedAlpha.changed.add(this.specificationChanged.dispatch);
+    this.displayState.objectAlpha.changed.add(this.specificationChanged.dispatch);
+    this.displayState.hideSegmentZero.changed.add(this.specificationChanged.dispatch);
+    this.displayState.fragmentMain.changed.add(this.specificationChanged.dispatch);
+    this.displayState.segmentColorHash.changed.add(this.specificationChanged.dispatch);
+    this.tabs.add(
+        'rendering', {label: 'Rendering', order: -100, getter: () => new DisplayOptionsTab(this)});
+    this.tabs.default = 'rendering';
+  }
+
+  get volumeOptions() {
+    return {volumeType: VolumeType.SEGMENTATION};
+  }
+
+  restoreState(specification: any) {
+    super.restoreState(specification);
+    this.displayState.selectedAlpha.restoreState(specification[SELECTED_ALPHA_JSON_KEY]);
+    this.displayState.saturation.restoreState(specification[SATURATION_JSON_KEY]);
+    this.displayState.notSelectedAlpha.restoreState(specification[NOT_SELECTED_ALPHA_JSON_KEY]);
+    this.displayState.objectAlpha.restoreState(specification[OBJECT_ALPHA_JSON_KEY]);
+    this.displayState.hideSegmentZero.restoreState(specification[HIDE_SEGMENT_ZERO_JSON_KEY]);
+    this.displayState.fragmentMain.restoreState(specification[SKELETON_SHADER_JSON_KEY]);
+    this.displayState.segmentColorHash.restoreState(specification[COLOR_SEED_JSON_KEY]);
+
+    verifyObjectProperty(specification, EQUIVALENCES_JSON_KEY, y => {
+      this.displayState.segmentEquivalences.restoreState(y);
     });
-    this.displayState.notSelectedAlpha.changed.add(() => {
-      this.specificationChanged.dispatch();
+
+    const restoreSegmentsList = (key: string, segments: Uint64Set) => {
+      verifyObjectProperty(specification, key, y => {
+        if (y !== undefined) {
+          let {segmentEquivalences} = this.displayState;
+          parseArray(y, value => {
+            let id = Uint64.parseString(String(value), 10);
+            segments.add(segmentEquivalences.get(id));
+          });
+        }
+      });
+    };
+
+    restoreSegmentsList(SEGMENTS_JSON_KEY, this.displayState.visibleSegments);
+    restoreSegmentsList(HIGHLIGHTS_JSON_KEY, this.displayState.highlightedSegments);
+
+    verifyObjectProperty(specification, CLIP_BOUNDS_JSON_KEY, y => {
+      if (y === undefined) {
+        return;
+      }
+      let center: vec3|undefined, size: vec3|undefined;
+      verifyObjectProperty(y, 'center', z => center = verify3dVec(z));
+      verifyObjectProperty(y, 'size', z => size = verify3dVec(z));
+      if (!center || !size) {
+        return;
+      }
+      let bounds = {center, size};
+      this.displayState.clipBounds.value = bounds;
     });
-    this.displayState.objectAlpha.changed.add(() => {
-      this.specificationChanged.dispatch();
-    });
-    this.displayState.hideSegmentZero.changed.add(() => {
-      this.specificationChanged.dispatch();
-    });
-    this.displayState.fragmentMain.changed.add(() => {
+    this.displayState.highlightedSegments.changed.add(() => {
       this.specificationChanged.dispatch();
     });
 
-    this.displayState.selectedAlpha.restoreState(x[SELECTED_ALPHA_JSON_KEY]);
-    this.displayState.notSelectedAlpha.restoreState(x[NOT_SELECTED_ALPHA_JSON_KEY]);
-    this.displayState.objectAlpha.restoreState(x[OBJECT_ALPHA_JSON_KEY]);
-    this.displayState.hideSegmentZero.restoreState(x[HIDE_SEGMENT_ZERO_JSON_KEY]);
-    this.displayState.objectToDataTransform.restoreState(x['transform']);
-    this.displayState.fragmentMain.restoreState(x['skeletonShader']);
+    const {multiscaleSource} = this;
+    let meshPath = this.meshPath = specification[MESH_JSON_KEY] === null ?
+        null :
+        verifyOptionalString(specification[MESH_JSON_KEY]);
+    let skeletonsPath = this.skeletonsPath =
+        verifyObjectProperty(specification, SKELETONS_JSON_KEY, verifyOptionalString);
 
-    let volumePath = this.volumePath = verifyOptionalString(x['source']);
-    let meshPath = this.meshPath = x['mesh'] === null ? null : verifyOptionalString(x['mesh']);
-    let skeletonsPath = this.skeletonsPath = verifyOptionalString(x['skeletons']);
     let remaining = 0;
-    if (volumePath !== undefined) {
+    if (meshPath != null) {
       ++remaining;
-      getVolumeWithStatusMessage(manager.dataSourceProvider, manager.chunkManager, volumePath, {
-        volumeType: VolumeType.SEGMENTATION
-      }).then(volume => {
+      this.manager.dataSourceProvider.getMeshSource(this.manager.chunkManager, meshPath)
+          .then(meshSource => {
+            if (!this.wasDisposed) {
+              this.addMesh(meshSource);
+              if (--remaining === 0) {
+                this.isReady = true;
+              }
+            }
+          });
+    }
+
+    if (skeletonsPath !== undefined) {
+      ++remaining;
+      this.manager.dataSourceProvider.getSkeletonSource(this.manager.chunkManager, skeletonsPath)
+          .then(skeletonSource => {
+            if (!this.wasDisposed) {
+              this.addSkeletonSource(skeletonSource);
+              if (--remaining === 0) {
+                this.isReady = true;
+              }
+            }
+          });
+    }
+
+    if (multiscaleSource !== undefined) {
+      ++remaining;
+      multiscaleSource.then(volume => {
         if (!this.wasDisposed) {
           this.addRenderLayer(new SegmentationRenderLayer(volume, this.displayState));
           if (meshPath === undefined && skeletonsPath === undefined) {
@@ -153,60 +226,6 @@ export class SegmentationUserLayer extends UserLayer {
         }
       });
     }
-
-    if (meshPath != null) {
-      ++remaining;
-      this.manager.dataSourceProvider.getMeshSource(manager.chunkManager, meshPath)
-          .then(meshSource => {
-            if (!this.wasDisposed) {
-              this.addMesh(meshSource);
-              if (--remaining === 0) {
-                this.isReady = true;
-              }
-            }
-          });
-    }
-
-    if (skeletonsPath !== undefined) {
-      ++remaining;
-      this.manager.dataSourceProvider.getSkeletonSource(manager.chunkManager, skeletonsPath)
-          .then(skeletonSource => {
-            if (!this.wasDisposed) {
-              this.addSkeletonSource(skeletonSource);
-              if (--remaining === 0) {
-                this.isReady = true;
-              }
-            }
-          });
-    }
-
-    verifyObjectProperty(x, 'equivalences', y => {
-      this.displayState.segmentEquivalences.restoreState(y);
-    });
-
-    verifyObjectProperty(x, 'segments', y => {
-      if (y !== undefined) {
-        let {visibleSegments, segmentEquivalences} = this.displayState;
-        parseArray(y, value => {
-          let id = Uint64.parseString(String(value), 10);
-          visibleSegments.add(segmentEquivalences.get(id));
-        });
-      }
-    });
-
-    verifyObjectProperty(x, 'clipBounds', y => {
-      if (y === undefined) {
-        return;
-      }
-      let center: vec3|undefined, size: vec3|undefined;
-      verifyObjectProperty(y, 'center', z => center = verify3dVec(z));
-      verifyObjectProperty(y, 'size', z => size = verify3dVec(z));
-      if (!center || !size) {
-        return;
-      }
-      let bounds = {center, size};
-      this.displayState.clipBounds.value = bounds;
-    });
   }
 
   addMesh(meshSource: MeshSource) {
@@ -223,31 +242,36 @@ export class SegmentationUserLayer extends UserLayer {
   }
 
   toJSON() {
-    let x: any = {'type': 'segmentation'};
-    x['source'] = this.volumePath;
-    x['mesh'] = this.meshPath;
-    x['skeletons'] = this.skeletonsPath;
+    const x = super.toJSON();
+    x['type'] = 'segmentation';
+    x[MESH_JSON_KEY] = this.meshPath;
+    x[SKELETONS_JSON_KEY] = this.skeletonsPath;
     x[SELECTED_ALPHA_JSON_KEY] = this.displayState.selectedAlpha.toJSON();
     x[NOT_SELECTED_ALPHA_JSON_KEY] = this.displayState.notSelectedAlpha.toJSON();
+    x[SATURATION_JSON_KEY] = this.displayState.saturation.toJSON();
     x[OBJECT_ALPHA_JSON_KEY] = this.displayState.objectAlpha.toJSON();
     x[HIDE_SEGMENT_ZERO_JSON_KEY] = this.displayState.hideSegmentZero.toJSON();
+    x[COLOR_SEED_JSON_KEY] = this.displayState.segmentColorHash.toJSON();
     let {visibleSegments} = this.displayState;
     if (visibleSegments.size > 0) {
-      x['segments'] = visibleSegments.toJSON();
+      x[SEGMENTS_JSON_KEY] = visibleSegments.toJSON();
+    }
+    let {highlightedSegments} = this.displayState;
+    if (highlightedSegments.size > 0) {
+      x[HIGHLIGHTS_JSON_KEY] = highlightedSegments.toJSON();
     }
     let {segmentEquivalences} = this.displayState;
     if (segmentEquivalences.size > 0) {
-      x['equivalences'] = segmentEquivalences.toJSON();
+      x[EQUIVALENCES_JSON_KEY] = segmentEquivalences.toJSON();
     }
     let {clipBounds} = this.displayState;
     if (clipBounds.value) {
-      x['clipBounds'] = {
-        center: clipBounds.value.center,
-        size: clipBounds.value.size,
+      x[CLIP_BOUNDS_JSON_KEY] = {
+        center: Array.from(clipBounds.value.center),
+        size: Array.from(clipBounds.value.size),
       };
     }
-    x['transform'] = this.displayState.objectToDataTransform.toJSON();
-    x['skeletonShader'] = this.displayState.fragmentMain.toJSON();
+    x[SKELETON_SHADER_JSON_KEY] = this.displayState.fragmentMain.toJSON();
     return x;
   }
 
@@ -267,10 +291,6 @@ export class SegmentationUserLayer extends UserLayer {
       return value;
     }
     return new Uint64MapEntry(value, mappedValue);
-  }
-
-  makeDropdown(element: HTMLDivElement) {
-    return new SegmentationDropdown(element, this);
   }
 
   handleAction(action: string) {
@@ -296,6 +316,19 @@ export class SegmentationUserLayer extends UserLayer {
         }
         break;
       }
+      case 'highlight': {
+        let {segmentSelectionState} = this.displayState;
+        if (segmentSelectionState.hasSelectedSegment) {
+          let segment = segmentSelectionState.selectedSegment;
+          let {highlightedSegments} = this.displayState;
+          if (highlightedSegments.has(segment)) {
+            highlightedSegments.delete(segment);
+          } else {
+            highlightedSegments.add(segment);
+          }
+        }
+        break;
+      }
     }
   }
 }
@@ -308,27 +341,30 @@ function makeSkeletonShaderCodeWidget(layer: SegmentationUserLayer) {
   });
 }
 
-class SegmentationDropdown extends UserLayerDropdown {
+class DisplayOptionsTab extends Tab {
   visibleSegmentWidget = this.registerDisposer(new SegmentSetWidget(this.layer.displayState));
   addSegmentWidget = this.registerDisposer(new Uint64EntryWidget());
   selectedAlphaWidget =
       this.registerDisposer(new RangeWidget(this.layer.displayState.selectedAlpha));
   notSelectedAlphaWidget =
       this.registerDisposer(new RangeWidget(this.layer.displayState.notSelectedAlpha));
+  saturationWidget = this.registerDisposer(new RangeWidget(this.layer.displayState.saturation));
   objectAlphaWidget = this.registerDisposer(new RangeWidget(this.layer.displayState.objectAlpha));
   codeWidget: ShaderCodeWidget|undefined;
-
-  constructor(public element: HTMLDivElement, public layer: SegmentationUserLayer) {
+  constructor(public layer: SegmentationUserLayer) {
     super();
+    const {element} = this;
     element.classList.add('segmentation-dropdown');
-    let {selectedAlphaWidget, notSelectedAlphaWidget, objectAlphaWidget} = this;
+    let {selectedAlphaWidget, notSelectedAlphaWidget, saturationWidget, objectAlphaWidget} = this;
     selectedAlphaWidget.promptElement.textContent = 'Opacity (on)';
     notSelectedAlphaWidget.promptElement.textContent = 'Opacity (off)';
+    saturationWidget.promptElement.textContent = 'Saturation';
     objectAlphaWidget.promptElement.textContent = 'Opacity (3d)';
 
     if (this.layer.volumePath !== undefined) {
       element.appendChild(this.selectedAlphaWidget.element);
       element.appendChild(this.notSelectedAlphaWidget.element);
+      element.appendChild(this.saturationWidget.element);
     }
     this.registerDisposer(new ElementVisibilityFromTrackableBoolean(
         this.registerDisposer(new ComputedWatchableValue(
@@ -362,6 +398,7 @@ class SegmentationDropdown extends UserLayerDropdown {
       }
     }));
     element.appendChild(this.registerDisposer(this.visibleSegmentWidget).element);
+
     const maybeAddSkeletonShaderUI = () => {
       if (this.codeWidget !== undefined) {
         return;
@@ -406,12 +443,14 @@ class SegmentationDropdown extends UserLayerDropdown {
     };
     this.registerDisposer(this.layer.objectLayerStateChanged.add(maybeAddSkeletonShaderUI));
     maybeAddSkeletonShaderUI();
-  }
 
-  onShow() {
-    if (this.codeWidget !== undefined) {
-      this.codeWidget.textEditor.refresh();
-    }
+    this.visibility.changed.add(() => {
+      if (this.visible) {
+        if (this.codeWidget !== undefined) {
+          this.codeWidget.textEditor.refresh();
+        }
+      }
+    });
   }
 }
 

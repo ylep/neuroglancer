@@ -21,16 +21,18 @@ import {PickIDManager} from 'neuroglancer/object_picking';
 import {RenderedDataPanel, RenderedDataViewerState} from 'neuroglancer/rendered_data_panel';
 import {SliceView, SliceViewRenderHelper} from 'neuroglancer/sliceview/frontend';
 import {TrackableBoolean} from 'neuroglancer/trackable_boolean';
+import {TrackableRGB} from 'neuroglancer/util/color';
 import {ActionEvent, registerActionListener} from 'neuroglancer/util/event_action_map';
 import {identityMat4, mat4, vec3, vec4} from 'neuroglancer/util/geom';
 import {startRelativeMouseDrag} from 'neuroglancer/util/mouse_drag';
-import {GL_BLEND, GL_COLOR_BUFFER_BIT, GL_ONE_MINUS_SRC_ALPHA, GL_SCISSOR_TEST, GL_SRC_ALPHA} from 'neuroglancer/webgl/constants';
-import {FramebufferConfiguration, makeTextureBuffers, OffscreenCopyHelper} from 'neuroglancer/webgl/offscreen';
+import {FramebufferConfiguration, OffscreenCopyHelper, TextureBuffer} from 'neuroglancer/webgl/offscreen';
 import {ShaderBuilder, ShaderModule} from 'neuroglancer/webgl/shader';
-import {ScaleBarTexture} from 'neuroglancer/widget/scale_bar';
+import {ScaleBarTexture, TrackableScaleBarOptions} from 'neuroglancer/widget/scale_bar';
 
 export interface SliceViewerState extends RenderedDataViewerState {
   showScaleBar: TrackableBoolean;
+  scaleBarOptions: TrackableScaleBarOptions;
+  crossSectionBackgroundColor: TrackableRGB;
 }
 
 export enum OffscreenTextures {
@@ -40,20 +42,23 @@ export enum OffscreenTextures {
 }
 
 function sliceViewPanelEmitColor(builder: ShaderBuilder) {
+  builder.addOutputBuffer('vec4', 'out_fragColor', null);
   builder.addFragmentCode(`
-void emit(vec4 color, vec4 pickId) {
-  gl_FragColor = color;
+void emit(vec4 color, highp uint pickId) {
+  out_fragColor = color;
 }
 `);
 }
 
 function sliceViewPanelEmitPickID(builder: ShaderBuilder) {
+  builder.addOutputBuffer('highp float', 'out_pickId', null);
   builder.addFragmentCode(`
-void emit(vec4 color, vec4 pickId) {
-  gl_FragColor = pickId;
+void emit(vec4 color, highp uint pickId) {
+  out_pickId = float(pickId);
 }
 `);
 }
+
 
 export interface SliceViewPanelRenderContext {
   dataToDevice: mat4;
@@ -79,13 +84,21 @@ export interface SliceViewPanelRenderContext {
    * Height of GL viewport in pixels.
    */
   viewportHeight: number;
+
+  sliceView: SliceView;
 }
 
 export class SliceViewPanelRenderLayer extends VisibilityTrackedRenderLayer {
   draw(_renderContext: SliceViewPanelRenderContext) {
     // Must be overridden by subclasses.
   }
+
+  isReady() {
+    return true;
+  }
 }
+
+const tempVec4 = vec4.create();
 
 export class SliceViewPanel extends RenderedDataPanel {
   viewer: SliceViewerState;
@@ -94,14 +107,21 @@ export class SliceViewPanel extends RenderedDataPanel {
   private sliceViewRenderHelper =
       this.registerDisposer(SliceViewRenderHelper.get(this.gl, sliceViewPanelEmitColor));
   private colorFactor = vec4.fromValues(1, 1, 1, 1);
-  private backgroundColor = vec4.fromValues(0.5, 0.5, 0.5, 1.0);
   private pickIDs = new PickIDManager();
 
   private visibleLayerTracker = makeRenderedPanelVisibleLayerTracker(
-      this.viewer.layerManager, SliceViewPanelRenderLayer, this);
+      this.viewer.layerManager, SliceViewPanelRenderLayer, this.viewer.visibleLayerRoles, this);
 
-  private offscreenFramebuffer = this.registerDisposer(new FramebufferConfiguration(
-      this.gl, {colorBuffers: makeTextureBuffers(this.gl, OffscreenTextures.NUM_TEXTURES)}));
+  private offscreenFramebuffer = this.registerDisposer(new FramebufferConfiguration(this.gl, {
+    colorBuffers: [
+      new TextureBuffer(
+          this.gl, WebGL2RenderingContext.RGBA8, WebGL2RenderingContext.RGBA,
+          WebGL2RenderingContext.UNSIGNED_BYTE),
+      new TextureBuffer(
+          this.gl, WebGL2RenderingContext.R32F, WebGL2RenderingContext.RED,
+          WebGL2RenderingContext.FLOAT),
+    ]
+  }));
 
   private offscreenCopyHelper = this.registerDisposer(OffscreenCopyHelper.get(this.gl));
   private scaleBarCopyHelper = this.registerDisposer(OffscreenCopyHelper.get(this.gl));
@@ -145,6 +165,8 @@ export class SliceViewPanel extends RenderedDataPanel {
     });
 
     this.registerDisposer(sliceView);
+    this.registerDisposer(
+        viewer.crossSectionBackgroundColor.changed.add(() => this.scheduleRedraw()));
     this.registerDisposer(sliceView.visibility.add(this.visibility));
     this.registerDisposer(sliceView.viewChanged.add(() => {
       if (this.visible) {
@@ -162,35 +184,68 @@ export class SliceViewPanel extends RenderedDataPanel {
         this.context.scheduleRedraw();
       }
     }));
+    this.registerDisposer(viewer.scaleBarOptions.changed.add(() => {
+      if (this.visible) {
+        this.context.scheduleRedraw();
+      }
+    }));
+  }
+
+  translateDataPointByViewportPixels(out: vec3, orig: vec3, deltaX: number, deltaY: number): vec3 {
+    vec3.transformMat4(out, orig, this.sliceView.dataToViewport);
+    vec3.set(out, out[0] - deltaX, out[1] - deltaY, out[2]);
+    vec3.transformMat4(out, out, this.sliceView.viewportToData);
+    return out;
   }
 
   isReady() {
-    return this.sliceView.isReady();
+    if (!this.visible) {
+      return false;
+    }
+
+    if (!this.sliceView.isReady()) {
+      return false;
+    }
+
+    let visibleLayers = this.visibleLayerTracker.getVisibleLayers();
+    for (let renderLayer of visibleLayers) {
+      if (!renderLayer.isReady()) {
+        return false;
+      }
+    }
+    return true;
   }
 
   draw() {
     let {sliceView} = this;
+    this.onResize();
+    sliceView.updateRendering();
     if (!sliceView.hasValidViewport) {
       return;
     }
-    this.onResize();
-    sliceView.updateRendering();
 
     let {gl} = this;
 
     let {width, height, dataToDevice} = sliceView;
     this.offscreenFramebuffer.bind(width, height);
-    gl.disable(GL_SCISSOR_TEST);
+    gl.disable(WebGL2RenderingContext.SCISSOR_TEST);
     this.gl.clearColor(0.0, 0.0, 0.0, 0.0);
-    gl.clear(GL_COLOR_BUFFER_BIT);
+    gl.clear(WebGL2RenderingContext.COLOR_BUFFER_BIT);
 
     // Draw axes lines.
     // FIXME: avoid use of temporary matrix
     let mat = mat4.create();
 
+    const backgroundColor = tempVec4;
+    const crossSectionBackgroundColor = this.viewer.crossSectionBackgroundColor.value;
+    backgroundColor[0] = crossSectionBackgroundColor[0];
+    backgroundColor[1] = crossSectionBackgroundColor[1];
+    backgroundColor[2] = crossSectionBackgroundColor[2];
+    backgroundColor[3] = 1;
+
     this.sliceViewRenderHelper.draw(
         sliceView.offscreenFramebuffer.colorBuffers[0].texture, identityMat4, this.colorFactor,
-        this.backgroundColor, 0, 0, 1, 1);
+        backgroundColor, 0, 0, 1, 1);
 
     let visibleLayers = this.visibleLayerTracker.getVisibleLayers();
     let {pickIDs} = this;
@@ -204,13 +259,14 @@ export class SliceViewPanel extends RenderedDataPanel {
       emitPickID: false,
       viewportWidth: width,
       viewportHeight: height,
+      sliceView,
     };
-    gl.enable(GL_BLEND);
-    gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    gl.enable(WebGL2RenderingContext.BLEND);
+    gl.blendFunc(WebGL2RenderingContext.SRC_ALPHA, WebGL2RenderingContext.ONE_MINUS_SRC_ALPHA);
     for (let renderLayer of visibleLayers) {
       renderLayer.draw(renderContext);
     }
-    gl.disable(GL_BLEND);
+    gl.disable(WebGL2RenderingContext.BLEND);
     this.offscreenFramebuffer.bindSingle(OffscreenTextures.PICK);
     renderContext.emitColor = false;
     renderContext.emitPickID = true;
@@ -247,16 +303,21 @@ export class SliceViewPanel extends RenderedDataPanel {
         this.axesLineHelper.draw(mat);
       }
       if (this.viewer.showScaleBar.value) {
-        gl.enable(GL_BLEND);
-        gl.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        gl.enable(WebGL2RenderingContext.BLEND);
+        gl.blendFunc(WebGL2RenderingContext.SRC_ALPHA, WebGL2RenderingContext.ONE_MINUS_SRC_ALPHA);
+        const options = this.viewer.scaleBarOptions.value;
         const {scaleBarTexture} = this;
         const {dimensions} = scaleBarTexture;
-        dimensions.targetLengthInPixels = Math.min(width / 4, 100);
+        dimensions.targetLengthInPixels = Math.min(
+            options.maxWidthFraction * width, options.maxWidthInPixels * options.scaleFactor);
         dimensions.nanometersPerPixel = sliceView.pixelSize;
-        scaleBarTexture.update();
-        gl.viewport(10, 10, scaleBarTexture.width, scaleBarTexture.height);
+        scaleBarTexture.update(options);
+        gl.viewport(
+            options.leftPixelOffset * options.scaleFactor,
+            options.bottomPixelOffset * options.scaleFactor, scaleBarTexture.width,
+            scaleBarTexture.height);
         this.scaleBarCopyHelper.draw(scaleBarTexture.texture);
-        gl.disable(GL_BLEND);
+        gl.disable(WebGL2RenderingContext.BLEND);
       }
     }
 
@@ -269,7 +330,7 @@ export class SliceViewPanel extends RenderedDataPanel {
   }
 
   onResize() {
-    this.sliceView.setViewportSize(this.element.clientWidth, this.element.clientHeight);
+    this.sliceView.setViewportSizeDebounced(this.element.clientWidth, this.element.clientHeight);
   }
 
   updateMouseState(mouseState: MouseSelectionState) {
@@ -290,9 +351,9 @@ export class SliceViewPanel extends RenderedDataPanel {
     vec3.transformMat4(out, out, sliceView.viewportToData);
 
     let glWindowY = height - y;
-    this.pickIDs.setMouseState(
-        mouseState,
-        offscreenFramebuffer.readPixelAsUint32(OffscreenTextures.PICK, glWindowX, glWindowY));
+    const pickValue =
+        offscreenFramebuffer.readPixelFloat32(OffscreenTextures.PICK, glWindowX, glWindowY);
+    this.pickIDs.setMouseState(mouseState, pickValue);
     return true;
   }
 
