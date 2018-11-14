@@ -411,15 +411,13 @@ export class MousePositionWidget extends RefCounted {
     const updateViewFunction =
         this.registerCancellable(animationFrameDebounce(() => this.updateView()));
     this.registerDisposer(mouseState.changed.add(updateViewFunction));
-    this.registerDisposer(voxelSize.changed.add(updateViewFunction));
   }
   updateView() {
     let text = '';
-    const {mouseState, voxelSize} = this;
-    if (mouseState.active && voxelSize.valid) {
-      const p = this.tempPosition;
-      voxelSize.voxelFromSpatial(p, mouseState.position);
-      text = `x ${Math.floor(p[0])},  y ${Math.floor(p[1])},  z ${Math.floor(p[2])}`;
+    const {mouseState} = this;
+    if (mouseState.active) {
+      const p = mouseState.position;
+      text = `x ${(p[0] * 1e-6).toFixed(6)},  y ${(p[1] * 1e-6).toFixed(6)},  z ${(p[2] * 1e-6).toFixed(6)} mm`;
     }
     this.element.textContent = text;
   }
