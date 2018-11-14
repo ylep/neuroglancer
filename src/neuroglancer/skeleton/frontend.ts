@@ -30,16 +30,13 @@ import {stableStringify, verifyString} from 'neuroglancer/util/json';
 import {getObjectId} from 'neuroglancer/util/object_id';
 import {NullarySignal} from 'neuroglancer/util/signal';
 import {Buffer} from 'neuroglancer/webgl/buffer';
-import {GL_FLOAT} from 'neuroglancer/webgl/constants';
 import {GL} from 'neuroglancer/webgl/context';
 import {WatchableShaderError} from 'neuroglancer/webgl/dynamic_shader';
 import {ShaderBuilder, ShaderModule, ShaderProgram} from 'neuroglancer/webgl/shader';
-import {setVec4FromUint32} from 'neuroglancer/webgl/shader_lib';
 
 const glsl_COLORMAPS = require<string>('neuroglancer/webgl/colormaps.glsl');
 
 const tempMat2 = mat4.create();
-const tempPickID = new Float32Array(4);
 
 const DEFAULT_FRAGMENT_MAIN = `void main() {
   emitDefault();
@@ -72,7 +69,7 @@ class RenderHelper extends RefCounted {
   defineShader(builder: ShaderBuilder, fragmentMain: string) {
     builder.addUniform('highp vec4', 'uColor');
     builder.addUniform('highp mat4', 'uProjection');
-    builder.addUniform('highp vec4', 'uPickID');
+    builder.addUniform('highp uint', 'uPickID');
     let vertexMain = `
 gl_Position = uProjection * vec4(aVertex0, 1.0);
 `;
@@ -104,7 +101,8 @@ void emitDefault() {
   }
 
   beginLayer(
-      gl: GL, shader: ShaderProgram, renderContext: SliceViewPanelRenderContext,
+      gl: GL, shader: ShaderProgram,
+      renderContext: SliceViewPanelRenderContext|PerspectiveViewRenderContext,
       objectToDataMatrix: mat4) {
     let {dataToDevice} = renderContext;
     let mat = mat4.multiply(tempMat2, dataToDevice, objectToDataMatrix);
@@ -128,7 +126,7 @@ void emitDefault() {
   }
 
   setPickID(gl: GL, shader: ShaderProgram, pickID: number) {
-    gl.uniform4fv(shader.uniform('uPickID'), setVec4FromUint32(tempPickID, pickID));
+    gl.uniform1ui(shader.uniform('uPickID'), pickID);
   }
 
   drawSkeleton(gl: GL, shader: ShaderProgram, skeletonChunk: SkeletonChunk) {
@@ -234,8 +232,8 @@ export class SkeletonLayer extends RefCounted {
   }
 
   draw(
-      renderContext: SliceViewPanelRenderContext, layer: RenderLayer, renderHelper: RenderHelper,
-      lineWidth?: number) {
+      renderContext: SliceViewPanelRenderContext|PerspectiveViewRenderContext, layer: RenderLayer,
+      renderHelper: RenderHelper, lineWidth?: number) {
     if (lineWidth === undefined) {
       lineWidth = renderContext.emitColor ? 1 : 5;
     }
@@ -333,7 +331,7 @@ export class SliceViewPanelSkeletonLayer extends SliceViewPanelRenderLayer {
 function getWebglDataType(dataType: DataType) {
   switch (dataType) {
     case DataType.FLOAT32:
-      return GL_FLOAT;
+      return WebGL2RenderingContext.FLOAT;
     default:
       throw new Error('Data type not supported by WebGL: ${DataType[dataType]}');
   }
@@ -343,7 +341,7 @@ const vertexPositionAttribute: VertexAttributeRenderInfo = {
   dataType: DataType.FLOAT32,
   numComponents: 3,
   name: '',
-  webglDataType: GL_FLOAT,
+  webglDataType: WebGL2RenderingContext.FLOAT,
   glslDataType: 'vec3',
 };
 
